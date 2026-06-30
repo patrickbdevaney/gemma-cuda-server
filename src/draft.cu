@@ -35,7 +35,9 @@ __device__ __forceinline__ float bf2f(uint16_t h){ unsigned u=(unsigned)h<<16; f
 // ---------------- kernels ----------------
 // out[M,N] = x[M,K] @ W_bf16[N,K]^T   (one thread per output element, loop over K)
 // warp-per-output: out[m,n]=dot(x[m],W[n]) over K, uint2 bf16 loads (4/load) + shfl reduce
-__global__ void k_linear_bf16(float* out,const float* x,const uint16_t* W,int M,int N,int K){
+// warp-per-(m,n): handles ANY M (used for the large-M context forward, M=valid_len). Weight re-read per m
+// but context weights (k/v_proj) are small so that's fine.
+__global__ void k_linear_bf16_bigM(float* out,const float* x,const uint16_t* W,int M,int N,int K){
     int lane=threadIdx.x&31; long o=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
     if(o>=(long)M*N) return; int n=o%N,m=o/N;
     const float* xr=x+(size_t)m*K; const uint2* wv=(const uint2*)(W+(size_t)n*K);
@@ -45,6 +47,22 @@ __global__ void k_linear_bf16(float* out,const float* x,const uint16_t* W,int M,
     #pragma unroll
     for(int s=16;s>0;s>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,s);
     if(lane==0) out[o]=acc;
+}
+// warp-per-output-COLUMN (M<=16): weight row W[n] read ONCE, reused across all M tokens (was M re-reads;
+// critical for the M=15 lm_head over the 262144 vocab and the M=16 block query linears).
+__global__ void k_linear_bf16(float* out,const float* x,const uint16_t* W,int M,int N,int K){
+    int lane=threadIdx.x&31; long n=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+    if(n>=N) return;
+    const uint2* wv=(const uint2*)(W+(size_t)n*K);
+    float acc[16]; for(int m=0;m<M;++m) acc[m]=0.f; int nv=K/4;
+    for(int vi=lane; vi<nv; vi+=32){ uint2 ww=__ldcs(&wv[vi]); const uint16_t* b=(const uint16_t*)&ww; int k=vi*4;
+        float w0=bf2f(b[0]),w1=bf2f(b[1]),w2=bf2f(b[2]),w3=bf2f(b[3]);
+        for(int m=0;m<M;++m){ const float* xv=x+(size_t)m*K+k; acc[m]+=xv[0]*w0+xv[1]*w1+xv[2]*w2+xv[3]*w3; } }
+    for(int m=0;m<M;++m){
+        #pragma unroll
+        for(int s=16;s>0;s>>=1) acc[m]+=__shfl_down_sync(0xffffffffu,acc[m],s);
+        if(lane==0) out[(size_t)m*N+n]=acc[m];
+    }
 }
 // RMSNorm: out = x*rsqrt(mean(x^2)+eps) [* bf16 weight if w!=null]. One block per row over `dim`.
 __global__ void k_rmsnorm(float* out,const float* x,const uint16_t* w,int dim,float eps){
@@ -123,7 +141,8 @@ void draft_free(DraftModel* d){ if(d){ delete d->st; delete d; } }
 // ---- helpers ----
 static void linbf(DraftModel* d,float* out,const float* x,const std::string& wname,int M,int N,int K){
     const uint16_t* W=d->dptr<const uint16_t*>(wname);
-    k_linear_bf16<<<(unsigned)(((long)M*N+7)/8),256>>>(out,x,W,M,N,K);
+    if(M<=16) k_linear_bf16<<<(unsigned)(((long)N+7)/8),256>>>(out,x,W,M,N,K);          // reuse W across M
+    else      k_linear_bf16_bigM<<<(unsigned)(((long)M*N+7)/8),256>>>(out,x,W,M,N,K);   // large-M context
 }
 static void rmsn(DraftModel* d,float* out,const float* x,const std::string& wname,int rows,int dim){
     const uint16_t* w = wname.empty()? nullptr : d->dptr<const uint16_t*>(wname);
@@ -142,6 +161,15 @@ static void rope_tables(const int* pos,int n,float** dc,float** ds){
 }
 static std::string LP(int l,const char* s){ return "layers."+std::to_string(l)+"."+s; }
 
+// device argmax over VOCAB for each of R rows (replaces 15.7MB D2H copy + serial host argmax)
+__global__ void k_argmax_draft(int* out,const float* lg,int V){
+    int r=blockIdx.x; __shared__ float sv[256]; __shared__ int si[256];
+    float bv=-1e30f; int bi=0;
+    for(int v=threadIdx.x;v<V;v+=256){ float x=lg[(size_t)r*V+v]; if(x>bv){bv=x;bi=v;} }
+    sv[threadIdx.x]=bv; si[threadIdx.x]=bi; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s && sv[threadIdx.x+s]>sv[threadIdx.x]){sv[threadIdx.x]=sv[threadIdx.x+s];si[threadIdx.x]=si[threadIdx.x+s];} __syncthreads(); }
+    if(threadIdx.x==0) out[r]=si[0];
+}
 // ---------------- propose ----------------
 void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int C,
                    int next_token, const uint16_t* embed_bf16, const uint16_t* lmhead_bf16,
@@ -234,12 +262,10 @@ void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int
     // ---- (C) logits for the 15 MASK positions (query slots 1..15) -> argmax ----
     float* hmask = hfin + (size_t)1*H;   // rows 1..15
     float* logits; CU(cudaMalloc(&logits,(size_t)NDRAFT*VOCAB*4));
-    { k_linear_bf16<<<(unsigned)(((long)NDRAFT*VOCAB+7)/8),256>>>(logits,hmask,lmhead_bf16,NDRAFT,VOCAB,H); }
-    CU(cudaDeviceSynchronize());
-    std::vector<float> hl((size_t)NDRAFT*VOCAB);
-    CU(cudaMemcpy(hl.data(),logits,(size_t)NDRAFT*VOCAB*4,cudaMemcpyDeviceToHost));
-    for(int r=0;r<k;++r){ const float* row=&hl[(size_t)r*VOCAB]; int best=0;
-        for(int v=1;v<VOCAB;++v) if(row[v]>row[best]) best=v; out_ids[r]=best; }
+    { k_linear_bf16<<<(unsigned)(((long)VOCAB+7)/8),256>>>(logits,hmask,lmhead_bf16,NDRAFT,VOCAB,H); }
+    int* did; CU(cudaMalloc(&did,k*4));               // device argmax: only need k token ids (not 15.7MB logits)
+    k_argmax_draft<<<k,256>>>(did,logits,VOCAB);
+    CU(cudaMemcpy(out_ids,did,k*4,cudaMemcpyDeviceToHost)); CU(cudaFree(did));
 
     cudaFree(fused);cudaFree(fused_n);cudaFree(ctx_dev);cudaFree(cdc);cudaFree(cds);
     cudaFree(Kctx);cudaFree(Vctx);cudaFree(qid_dev);cudaFree(qslot_dev);cudaFree(kslot_dev);
