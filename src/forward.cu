@@ -83,6 +83,26 @@ __global__ void sdpa_cache_kernel(float* out, const float* Q, const uint16_t* Kc
     out[((size_t)i*nh+h)*hd+d]=acc[d]/l_run;
 }
 
+// batched lm_head over mtok positions: logits[mtok,V]; each block loads one embed row, reused across positions
+__global__ void k_lmhead_batched(float* out,const float* hn,const uint16_t* emb,int H,int V,int mtok){
+    int v=blockIdx.x; if(v>=V)return; __shared__ float red[256];
+    for(int p=0;p<mtok;++p){
+        float acc=0; for(int h=threadIdx.x;h<H;h+=256) acc+=hn[(size_t)p*H+h]*bf2f(emb[(size_t)v*H+h]);
+        red[threadIdx.x]=acc; __syncthreads();
+        for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
+        if(threadIdx.x==0) out[(size_t)p*V+v]=red[0]; __syncthreads();
+    }
+}
+// device argmax over V for each of mtok rows
+__global__ void k_argmax(int* out,const float* lg,int V){
+    int p=blockIdx.x; __shared__ float sv[256]; __shared__ int si[256];
+    float bv=-1e30f; int bi=0;
+    for(int v=threadIdx.x;v<V;v+=256){ float x=lg[(size_t)p*V+v]; if(x>bv){bv=x;bi=v;} }
+    sv[threadIdx.x]=bv; si[threadIdx.x]=bi; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s && sv[threadIdx.x+s]>sv[threadIdx.x]){sv[threadIdx.x]=sv[threadIdx.x+s];si[threadIdx.x]=si[threadIdx.x+s];} __syncthreads(); }
+    if(threadIdx.x==0) out[p]=si[0];
+}
+
 // ---- Model ----
 struct Model {
     st::SafeTensors* st; uint8_t* draw; const uint8_t* h0;
@@ -307,11 +327,14 @@ int main(int argc,char**argv){
         lo.resize(VOCAB); CU(cudaMemcpy(lo.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
         if(prof){cudaEventRecord(c);cudaEventSynchronize(c);float ab,bc;cudaEventElapsedTime(&ab,a,b);cudaEventElapsedTime(&bc,b,c);t_layers+=ab;t_head+=bc;
             fprintf(stderr,"[prof] layers=%.1fms head=%.1fms (cum layers=%.0f head=%.0f)\n",ab,bc,t_layers,t_head);}
-        if(allarg){ allarg->resize(mtok); std::vector<float> tmp(VOCAB);
-            for(int p=0;p<mtok;++p){ rmsnorm(hl,h+(size_t)p*H,m.dptr<const uint16_t*>("model.language_model.norm.weight"),1,H,EPS,0);
-                k_lmhead<<<VOCAB,256>>>(dlog,hl,m.dptr<const uint16_t*>(embn),H,VOCAB,SOFTCAP); CU(cudaDeviceSynchronize());
-                CU(cudaMemcpy(tmp.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
-                int b=0; for(int i=1;i<VOCAB;++i) if(tmp[i]>tmp[b])b=i; (*allarg)[p]=b; } }
+        if(allarg){ allarg->resize(mtok);  // batched: norm all positions -> one batched lm_head -> device argmax
+            float *hln,*lg2; int* darg; CU(cudaMalloc(&hln,(size_t)mtok*H*4));
+            CU(cudaMalloc(&lg2,(size_t)mtok*VOCAB*4)); CU(cudaMalloc(&darg,mtok*4));
+            rmsnorm(hln,h,m.dptr<const uint16_t*>("model.language_model.norm.weight"),mtok,H,EPS,0);
+            k_lmhead_batched<<<VOCAB,256>>>(lg2,hln,m.dptr<const uint16_t*>(embn),H,VOCAB,mtok);
+            k_argmax<<<mtok,256>>>(darg,lg2,VOCAB); CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(allarg->data(),darg,mtok*4,cudaMemcpyDeviceToHost));
+            cudaFree(hln);cudaFree(lg2);cudaFree(darg); }
         cudaFree(dids);cudaFree(h);cudaFree(hl);cudaFree(dlog);
     };
     auto argmax=[&](const std::vector<float>& lg){ int b=0; for(int i=1;i<VOCAB;++i) if(lg[i]>lg[b])b=i; return b; };
