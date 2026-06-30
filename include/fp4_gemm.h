@@ -16,6 +16,11 @@ size_t nvfp4_scale_buffer_bytes(int outer, int K);
 // cuBLAS tile layout (host out buffer of size nvfp4_scale_buffer_bytes). OOB padding zeroed.
 void nvfp4_swizzle_scales(const uint8_t* logical, uint8_t* swizzled, int outer, int K);
 
+// FP4-weight GEMV for decode (M=1, W4A16). y[N] row-major = dequant(W[N,K]) @ x[K].
+// wp = raw packed weight [N,K/2], ws = raw E4M3 scales [N,K/16] (unswizzled). No activation quant.
+void fp4_gemv(float* y, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
+              int N, int K, cudaStream_t s);
+
 // One NVFP4 GEMM. All device pointers. D is fp32 col-major [M,N] ld=M. beta=0.
 // Returns cublasStatus_t (CUBLAS_STATUS_SUCCESS on success).
 int nvfp4_gemm(float* dD,

@@ -135,6 +135,12 @@ struct Session {
 
 // W4A4 Linear: out_row[M,N] = (in_row[M,K] @ W[N,K]^T) using stored global scales. Pads M>=128.
 static void linear(Model& m, float* out_row, const float* in_row, const std::string& prefix, int M, int N, int K){
+    if(M==1){ // decode fast path: FP4-weight GEMV (W4A16), raw weight (byte loads tolerate any alignment)
+        uint8_t* Wp = m.dptr<uint8_t*>(prefix+".weight_packed");
+        uint8_t* Ws = m.dptr<uint8_t*>(prefix+".weight_scale");
+        fp4_gemv(out_row, Wp, Ws, m.scalarF32(prefix+".weight_global_scale"), in_row, N, K, 0);
+        return;
+    }
     int Mp = M<128?128:M;
     CU(cudaMemset(SC->in_pad, 0, (size_t)Mp*K*4));
     CU(cudaMemcpy(SC->in_pad, in_row, (size_t)M*K*4, cudaMemcpyDeviceToDevice));
@@ -292,13 +298,18 @@ int main(int argc,char**argv){
         float* h; CU(cudaMalloc(&h,(size_t)mtok*H*4));
         k_embed<<<mtok,256>>>(h, m.dptr<const uint16_t*>(embn), dids, mtok, H, EMB_SCALE);
         CU(cudaDeviceSynchronize());
+        static double t_layers=0,t_head=0; bool prof=getenv("PROF");
+        cudaEvent_t a,b,c; if(prof){cudaEventCreate(&a);cudaEventCreate(&b);cudaEventCreate(&c);cudaEventRecord(a);}
         for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,mtok,base,L); moe(m,h,mtok,L); }
+        if(prof){cudaEventRecord(b);}
         float* hl; CU(cudaMalloc(&hl,H*4));
         rmsnorm(hl, h+(size_t)(mtok-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"),1,H,EPS,0);
         float* dlog; CU(cudaMalloc(&dlog,(size_t)VOCAB*4));
         k_lmhead<<<VOCAB,256>>>(dlog, hl, m.dptr<const uint16_t*>(embn), H, VOCAB, SOFTCAP);
         CU(cudaDeviceSynchronize());
         lo.resize(VOCAB); CU(cudaMemcpy(lo.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
+        if(prof){cudaEventRecord(c);cudaEventSynchronize(c);float ab,bc;cudaEventElapsedTime(&ab,a,b);cudaEventElapsedTime(&bc,b,c);t_layers+=ab;t_head+=bc;
+            fprintf(stderr,"[prof] layers=%.1fms head=%.1fms (cum layers=%.0f head=%.0f)\n",ab,bc,t_layers,t_head);}
         cudaFree(dids);cudaFree(h);cudaFree(hl);cudaFree(dlog);
     };
     auto argmax=[&](const std::vector<float>& lg){ int b=0; for(int i=1;i<VOCAB;++i) if(lg[i]>lg[b])b=i; return b; };

@@ -33,6 +33,28 @@ void nvfp4_swizzle_scales(const uint8_t* logical, uint8_t* swizzled, int outer, 
 #define LT_CHECK(x) do { cublasStatus_t s_ = (x); if (s_ != CUBLAS_STATUS_SUCCESS) { \
     fprintf(stderr, "cublasLt error %d at %s:%d\n", (int)s_, __FILE__, __LINE__); return (int)s_; } } while(0)
 
+// ---- FP4-weight GEMV for single-token decode (W4A16: FP4 weight x fp32 activation) ----
+// y[N] = sum_k (fp4(wp[n,k]) * e4m3(ws[n,k/16]) / w_gscale) * x[k].  Raw (unswizzled) weight+scales.
+__device__ __forceinline__ float e2m1_dec(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
+__device__ __forceinline__ float e4m3_dec(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):((1.f+man*0.125f)*exp2f((float)(e-7))); return s?-v:v; }
+__global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, float wg_inv,
+                                const float* x, int N, int K){
+    int n=blockIdx.x; if(n>=N) return;
+    const uint8_t* wpn=wp+(size_t)n*(K/2); const uint8_t* wsn=ws+(size_t)n*(K/16);
+    __shared__ float red[256]; float acc=0.f;
+    for(int k=threadIdx.x;k<K;k+=blockDim.x){
+        uint8_t byte=wpn[k>>1]; uint8_t code=(k&1)?(byte>>4):(byte&0xF);
+        acc += e2m1_dec(code) * (e4m3_dec(wsn[k>>4])*wg_inv) * x[k];
+    }
+    red[threadIdx.x]=acc; __syncthreads();
+    for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
+    if(threadIdx.x==0) y[n]=red[0];
+}
+void fp4_gemv(float* y, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
+              int N, int K, cudaStream_t s){
+    fp4_gemv_kernel<<<N,256,0,s>>>(y, wp, ws, 1.0f/w_gscale, x, N, K);
+}
+
 int nvfp4_gemm(float* dD,
                const uint8_t* dA_packed, const uint8_t* dA_scales_swz, float a_gscale,
                const uint8_t* dB_packed, const uint8_t* dB_scales_swz, float b_gscale,
