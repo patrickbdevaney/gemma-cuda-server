@@ -151,12 +151,14 @@ __global__ void k_router_top8(int* ids,float* ws,const float* scores,const uint1
 __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
     const uint8_t* const* gp,const uint8_t* const* gs,const float* gg,
     const uint8_t* const* up,const uint8_t* const* us,const float* ug,int mtok,int H,int MI){
-    long idx=blockIdx.x; int i=idx%MI; long rest=idx/MI; int j=rest%8,t=rest/8; int e=ids[(size_t)t*8+j];
+    int lane=threadIdx.x&31; long idx=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);  // warp per (t,j,i)
+    if(idx>=(long)mtok*8*MI) return;
+    int i=idx%MI; long rest=idx/MI; int j=rest%8,t=rest/8; int e=ids[(size_t)t*8+j];
     const __half* x=x2+(size_t)t*H;
     const unsigned* gpw=(const unsigned*)(gp[e]+(size_t)i*(H/2)); const uint8_t* gsw=gs[e]+(size_t)i*(H/16); float ginv=1.f/gg[e];
     const unsigned* upw=(const unsigned*)(up[e]+(size_t)i*(H/2)); const uint8_t* usw=us[e]+(size_t)i*(H/16); float uinv=1.f/ug[e];
-    __shared__ float rg[256],ru[256]; float ag=0,au=0; int nu=H/8;
-    for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8;
+    float ag=0,au=0; int nu=H/8;
+    for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
         uint4 xpk=*(const uint4*)(x+k); const __half2* xh2=(const __half2*)&xpk;  // 8 fp16 acts (4 half2)
         unsigned wg=__ldcs(&gpw[vi]); float sg=C_LUT[__ldcs(&gsw[k>>4])]*ginv; unsigned wu=__ldcs(&upw[vi]); float su=C_LUT[__ldcs(&usw[k>>4])]*uinv;
         const unsigned char* wgb=(const unsigned char*)&wg; const unsigned char* wub=(const unsigned char*)&wu;
@@ -165,9 +167,9 @@ __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
         for(int b=0;b<4;++b){ g2=__hfma2(dec_fp4x2(wgb[b]),xh2[b],g2); u2=__hfma2(dec_fp4x2(wub[b]),xh2[b],u2); }
         ag += sg*(__half2float(__low2half(g2))+__half2float(__high2half(g2)));
         au += su*(__half2float(__low2half(u2))+__half2float(__high2half(u2))); }
-    rg[threadIdx.x]=ag; ru[threadIdx.x]=au; __syncthreads();
-    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s){rg[threadIdx.x]+=rg[threadIdx.x+s];ru[threadIdx.x]+=ru[threadIdx.x+s];} __syncthreads(); }
-    if(threadIdx.x==0){ float g=rg[0]; float gel=0.5f*g*(1.f+tanhf(0.7978845608f*(g+0.044715f*g*g*g))); hbuf[idx]=__float2half(gel*ru[0]); }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1){ ag+=__shfl_down_sync(0xffffffffu,ag,o); au+=__shfl_down_sync(0xffffffffu,au,o); }
+    if(lane==0){ float gel=0.5f*ag*(1.f+tanhf(0.7978845608f*(ag+0.044715f*ag*ag*ag))); hbuf[idx]=__float2half(gel*au); }
 }
 // expert down: out[t,d] = sum_j ws[t,j]*(Wd_e[d]·hbuf[t,j]). WARP per (t,d): lanes stride over MI/8,
 // 8 experts FUSED into one accumulator -> ONE shfl reduce (vs 8 block reductions + 34% thread util before).
@@ -392,7 +394,7 @@ static void moe(Model& m, float* h, int seq, int L){
     rmsnorm(x2,resid,m.dptr<const uint16_t*>(P+"pre_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     k_f32_to_f16<<<(seq*H+255)/256,256>>>(x2_16, x2, seq*H);  // fp16 MoE activation for HW-decode gateup
     ExpertPtrs* ep=m.experts(L);
-    k_moe_gateup<<<(unsigned)(seq*TOPK*MOE_INT),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
+    k_moe_gateup<<<(unsigned)((seq*TOPK*MOE_INT+7)/8),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
     k_moe_down<<<(unsigned)((seq*H+7)/8),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
     rmsnorm(moe_out,moe_out,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     add_inplace(hs1, moe_out, seq*H, 0);
