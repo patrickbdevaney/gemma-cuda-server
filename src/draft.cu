@@ -96,13 +96,16 @@ __global__ void k_store_kv(float* cache,const float* src,const int* slots,int m,
 }
 // NON-CAUSAL attention: query i (0..BLK-1), head h. Attends to all `nkeys` cache slots in kslots.
 // Q[BLK,nh,hd] fp32, cache K/V [.,nkv,hd] fp32. Online softmax. block=hd threads.
+// blkstart = index in kslots where block keys begin (= context length). causal=1 -> block query i
+// attends only to block keys 0..i (the 4 sliding draft layers); causal=0 -> bidirectional (full layer).
 __global__ void k_attn(float* out,const float* Q,const float* Kc,const float* Vc,
-                       const int* kslots,int nkeys,int nh,int nkv,int hd,float scale){
+                       const int* kslots,int nkeys,int nh,int nkv,int hd,float scale,int blkstart,int causal){
     int i=blockIdx.x,h=blockIdx.y,d=threadIdx.x; int kvh=h/(nh/nkv);
     extern __shared__ float sh[]; float* Qs=sh; float* acc=sh+hd; float* red=sh+2*hd;
     Qs[d]=Q[((size_t)i*nh+h)*hd+d]; acc[d]=0.f; __syncthreads();
     float m_run=-1e30f,l_run=0.f;
     for(int j=0;j<nkeys;++j){
+        if(causal && j>=blkstart && (j-blkstart)>i) continue;   // causal within block (uniform across block threads)
         int slot=kslots[j];
         red[d]=Qs[d]*Kc[((size_t)slot*nkv+kvh)*hd+d]; __syncthreads();
         for(int s=hd/2;s>0;s>>=1){ if(d<s)red[d]+=red[d+s]; __syncthreads(); }
@@ -241,8 +244,8 @@ void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int
         // append query K/V to cache at P0..P0+15 (V not roped)
         k_store_kv<<<(BLK*KD+255)/256,256>>>(d->Kc[l],kk,qslot_dev,BLK,NKV,HD);
         k_store_kv<<<(BLK*KD+255)/256,256>>>(d->Vc[l],vv,qslot_dev,BLK,NKV,HD);
-        // non-causal attention over context ∪ block
-        k_attn<<<agrid,HD,shmem>>>(ao,q,d->Kc[l],d->Vc[l],kslot_dev,nkeys,NH,NKV,HD,SCALE);
+        // sliding layers 0-3: CAUSAL within block; full layer 4: bidirectional (per DFlash layer_types)
+        k_attn<<<agrid,HD,shmem>>>(ao,q,d->Kc[l],d->Vc[l],kslot_dev,nkeys,NH,NKV,HD,SCALE, nkeys-BLK, (l<4)?1:0);
         linbf(d, attn, ao, LP(l,"self_attn.o_proj.weight"), BLK, H, QD);
         // post_attention_layernorm fused: resid += attn; hn = rmsnorm(resid)
         k_add<<<(BLK*H+255)/256,256>>>(resid,attn,BLK*H);
