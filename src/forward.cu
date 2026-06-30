@@ -221,9 +221,11 @@ static void attention_cached(Model& m, Session& S, float* h, int mtok, int base,
 }
 
 // host fp32 copy of a bf16 tensor
-static std::vector<float> bf16_host(Model& m,const std::string& n){
+static const std::vector<float>& bf16_host(Model& m,const std::string& n){
+    static std::unordered_map<std::string,std::vector<float>> cache;  // memoize (router weights reused every step)
+    auto it=cache.find(n); if(it!=cache.end()) return it->second;
     const auto& t=m.T(n); int d=t.numel(); std::vector<float> o(d); const uint16_t* b=(const uint16_t*)t.data;
-    for(int i=0;i<d;++i){ unsigned u=(unsigned)b[i]<<16; memcpy(&o[i],&u,4);} return o; }
+    for(int i=0;i<d;++i){ unsigned u=(unsigned)b[i]<<16; memcpy(&o[i],&u,4);} return cache.emplace(n,std::move(o)).first->second; }
 
 // expert FFN for a gathered set of |T| tokens at expert e: out += down(gelu(gate(Xe))*up(Xe)) * w
 static void expert_ffn(Model& m,const std::string& EP,float* Xe,int nt,float* moe_out,const int* didx,const float* dw){
@@ -249,7 +251,7 @@ static void moe(Model& m, float* h, int seq, int L){
     rmsnorm(hs1,hs1,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_1.weight"),seq,H,EPS,0);
     // router on resid (host)
     std::vector<float> rh(seq*H); CU(cudaMemcpy(rh.data(),resid,(size_t)seq*H*4,cudaMemcpyDeviceToHost));
-    auto rscale=bf16_host(m,P+"router.scale"); auto rproj=bf16_host(m,P+"router.proj.weight"); auto pes=bf16_host(m,P+"router.per_expert_scale");
+    const auto& rscale=bf16_host(m,P+"router.scale"); const auto& rproj=bf16_host(m,P+"router.proj.weight"); const auto& pes=bf16_host(m,P+"router.per_expert_scale");
     double root=1.0/sqrt((double)H);
     std::vector<std::vector<std::pair<int,float>>> route(seq);
     for(int t=0;t<seq;++t){
