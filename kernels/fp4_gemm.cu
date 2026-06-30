@@ -51,7 +51,7 @@ __global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, 
     const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); const uint8_t* wsn=ws+(size_t)n*(K/16);
     float acc=0.f; int nu=K/8;
     for(int vi=lane; vi<nu; vi+=32){
-        unsigned w=wpn[vi]; int k=vi*8; float sc=lut[wsn[k>>4]];   // one e4m3 scale per 8 codes
+        unsigned w=__ldcs(&wpn[vi]); int k=vi*8; float sc=lut[__ldcs(&wsn[k>>4])];   // streaming weight loads (evict-first, keep acts cached)
         uint4 xpk=*(const uint4*)(x+k); const __half2* xh2=(const __half2*)&xpk;  // 4 half2 (8 fp16 acts)
         const unsigned char* wb=(const unsigned char*)&w;
         __half2 a2=__float2half2_rn(0.f);

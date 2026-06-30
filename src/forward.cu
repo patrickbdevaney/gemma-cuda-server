@@ -158,7 +158,7 @@ __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
     __shared__ float rg[256],ru[256]; float ag=0,au=0; int nu=H/8;
     for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8;
         uint4 xpk=*(const uint4*)(x+k); const __half2* xh2=(const __half2*)&xpk;  // 8 fp16 acts (4 half2)
-        unsigned wg=gpw[vi]; float sg=C_LUT[gsw[k>>4]]*ginv; unsigned wu=upw[vi]; float su=C_LUT[usw[k>>4]]*uinv;
+        unsigned wg=__ldcs(&gpw[vi]); float sg=C_LUT[__ldcs(&gsw[k>>4])]*ginv; unsigned wu=__ldcs(&upw[vi]); float su=C_LUT[__ldcs(&usw[k>>4])]*uinv;
         const unsigned char* wgb=(const unsigned char*)&wg; const unsigned char* wub=(const unsigned char*)&wu;
         __half2 g2=__float2half2_rn(0.f),u2=__float2half2_rn(0.f);
         #pragma unroll
@@ -169,25 +169,29 @@ __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
     for(int s=128;s>0;s>>=1){ if(threadIdx.x<s){rg[threadIdx.x]+=rg[threadIdx.x+s];ru[threadIdx.x]+=ru[threadIdx.x+s];} __syncthreads(); }
     if(threadIdx.x==0){ float g=rg[0]; float gel=0.5f*g*(1.f+tanhf(0.7978845608f*(g+0.044715f*g*g*g))); hbuf[idx]=__float2half(gel*ru[0]); }
 }
-// expert down: out[t,d] += ws[t,j]*(Wd_e[d]·hbuf[t,j]); warp per (t,j,d), atomicAdd (parallel over experts).
-// out must be pre-zeroed. mtok*8*H warp-outputs.
+// expert down: out[t,d] = sum_j ws[t,j]*(Wd_e[d]·hbuf[t,j]). WARP per (t,d): lanes stride over MI/8,
+// 8 experts FUSED into one accumulator -> ONE shfl reduce (vs 8 block reductions + 34% thread util before).
 __global__ void k_moe_down(float* out,const __half* hbuf,const int* ids,const float* ws,
     const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int mtok,int H,int MI){
-    long idx=blockIdx.x; int d=idx%H,t=idx/H;
-    __shared__ float red[256]; float acc=0; int nu=MI/8;
-    for(int j=0;j<8;++j){ int e=ids[(size_t)t*8+j]; float w=ws[(size_t)t*8+j];
-        const unsigned* dpw=(const unsigned*)(dp[e]+(size_t)d*(MI/2)); const uint8_t* dsw=ds[e]+(size_t)d*(MI/16); float dinv=1.f/dg[e];
-        const __half* hh=hbuf+((size_t)t*8+j)*MI; float s=0;
-        for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; unsigned wd=dpw[vi]; float sc=C_LUT[dsw[k>>4]]*dinv;
-            uint4 hpk=*(const uint4*)(hh+k); const __half2* hh2=(const __half2*)&hpk; const unsigned char* wdb=(const unsigned char*)&wd;
-            __half2 s2=__float2half2_rn(0.f);
+    int lane=threadIdx.x&31; long idx=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+    if(idx>=(long)mtok*H) return; int d=idx%H,t=idx/H;
+    int E[8]; float WI[8];   // hoist ints/floats only (avoid the 32-pointer register pressure that regressed)
+    #pragma unroll
+    for(int j=0;j<8;++j){ E[j]=ids[(size_t)t*8+j]; WI[j]=ws[(size_t)t*8+j]/dg[E[j]]; }
+    float acc=0; int nu=MI/8;
+    for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
+        #pragma unroll
+        for(int j=0;j<8;++j){ int e=E[j];
+            const unsigned* dpw=(const unsigned*)(dp[e]+(size_t)d*(MI/2)); const uint8_t* dsw=ds[e]+(size_t)d*(MI/16);
+            unsigned wd=__ldcs(&dpw[vi]); float sc=C_LUT[__ldcs(&dsw[k>>4])]*WI[j];
+            uint4 hpk=*(const uint4*)(hbuf+((size_t)t*8+j)*MI+k); const __half2* hh2=(const __half2*)&hpk;
+            const unsigned char* wdb=(const unsigned char*)&wd; __half2 s2=__float2half2_rn(0.f);
             #pragma unroll
             for(int b=0;b<4;++b) s2=__hfma2(dec_fp4x2(wdb[b]),hh2[b],s2);
-            s += sc*(__half2float(__low2half(s2))+__half2float(__high2half(s2))); }
-        red[threadIdx.x]=s; __syncthreads();
-        for(int sf=128;sf>0;sf>>=1){ if(threadIdx.x<sf)red[threadIdx.x]+=red[threadIdx.x+sf]; __syncthreads(); }
-        if(threadIdx.x==0) acc+=w*red[0]; __syncthreads(); }
-    if(threadIdx.x==0) out[(size_t)t*H+d]=acc;
+            acc += sc*(__half2float(__low2half(s2))+__half2float(__high2half(s2))); } }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,o);
+    if(lane==0) out[(size_t)t*H+d]=acc;
 }
 
 // device pointer arrays for one layer's 128 experts (indexable by device top-8 id)
@@ -389,7 +393,7 @@ static void moe(Model& m, float* h, int seq, int L){
     k_f32_to_f16<<<(seq*H+255)/256,256>>>(x2_16, x2, seq*H);  // fp16 MoE activation for HW-decode gateup
     ExpertPtrs* ep=m.experts(L);
     k_moe_gateup<<<(unsigned)(seq*TOPK*MOE_INT),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
-    k_moe_down<<<(unsigned)(seq*H),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
+    k_moe_down<<<(unsigned)((seq*H+7)/8),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
     rmsnorm(moe_out,moe_out,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     add_inplace(hs1, moe_out, seq*H, 0);
     rmsnorm(hs1, hs1, m.dptr<const uint16_t*>(P+"post_feedforward_layernorm.weight"), seq, H, EPS, 0);
