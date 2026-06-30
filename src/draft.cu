@@ -270,6 +270,18 @@ void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int
     k_argmax_draft<<<k,256>>>(did,logits,VOCAB);
     CU(cudaMemcpy(out_ids,did,k*4,cudaMemcpyDeviceToHost)); CU(cudaFree(did));
 
+    if(getenv("DBG_DRAFT")){ static int done=0; if(!done){ done=1;   // dump 1 propose call for PyTorch ref compare
+        FILE* f=fopen("/tmp/dbg_meta.txt","w"); fprintf(f,"%d %d %d\n",C,BLK,k);
+        for(int i=0;i<C;++i)fprintf(f,"%d ",ctx_pos[i]); fprintf(f,"\n");
+        for(int i=0;i<BLK;++i)fprintf(f,"%d ",qids[i]); fprintf(f,"\n");
+        for(int i=0;i<BLK;++i)fprintf(f,"%d ",qpos[i]); fprintf(f,"\n");
+        for(int i=0;i<k;++i)fprintf(f,"%d ",out_ids[i]); fprintf(f,"\n"); fclose(f);
+        std::vector<float> th((size_t)C*6*H); CU(cudaMemcpy(th.data(),taps_dev,(size_t)C*6*H*4,cudaMemcpyDeviceToHost));
+        FILE* g=fopen("/tmp/dbg_taps.bin","wb"); fwrite(th.data(),4,(size_t)C*6*H,g); fclose(g);
+        std::vector<float> hh((size_t)BLK*H); CU(cudaMemcpy(hh.data(),hfin,(size_t)BLK*H*4,cudaMemcpyDeviceToHost));
+        FILE* h2=fopen("/tmp/dbg_hfin.bin","wb"); fwrite(hh.data(),4,(size_t)BLK*H,h2); fclose(h2);
+        fprintf(stderr,"[DBG_DRAFT dumped C=%d k=%d]\n",C,k); } }
+
     cudaFree(fused);cudaFree(fused_n);cudaFree(ctx_dev);cudaFree(cdc);cudaFree(cds);
     cudaFree(Kctx);cudaFree(Vctx);cudaFree(qid_dev);cudaFree(qslot_dev);cudaFree(kslot_dev);
     cudaFree(qdc);cudaFree(qds);cudaFree(h);cudaFree(resid);cudaFree(hn);cudaFree(q);

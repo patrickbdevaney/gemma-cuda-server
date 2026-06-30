@@ -512,6 +512,8 @@ int main(int argc,char**argv){
             std::vector<int> block; block.reserve(k+1); block.push_back(tok);
             for(int i=0;i<k;++i) block.push_back(draft_ids[i]);
             run(block, S->valid_len, logits, taps_blk, &allarg);   // caches block KV, taps_blk[0..k], allarg[0..k]
+            if(getenv("DBG_DRAFT")){ static int d2=0; if(!d2){ d2=1; FILE* f=fopen("/tmp/dbg_target.txt","w");
+                for(int i=0;i<=k;++i) fprintf(f,"%d ",allarg[i]); fprintf(f,"\n"); fclose(f); } }
             int na=0; for(int i=0;i<k;++i){ if(draft_ids[i]==allarg[i]) na++; else break; }
             int newbonus = allarg[na];
             printf("%d ",tok); fflush(stdout); ngen++;
