@@ -241,23 +241,34 @@ int main(int argc,char**argv){
     // read token ids
     std::vector<int> ids; { FILE* f=fopen(tokfile.c_str(),"r"); int t; while(fscanf(f,"%d",&t)==1)ids.push_back(t); fclose(f);}
     int seq=ids.size(); printf("seq=%d tokens\n",seq);
-    int* dids; CU(cudaMalloc(&dids,seq*4)); CU(cudaMemcpy(dids,ids.data(),seq*4,cudaMemcpyHostToDevice));
-    float* h; CU(cudaMalloc(&h,(size_t)seq*H*4));
-    k_embed<<<seq,256>>>(h, m.dptr<const uint16_t*>("model.language_model.embed_tokens.weight"), dids, seq, H, EMB_SCALE);
-    CU(cudaDeviceSynchronize());
-    dump_h(h, seq, 0);
-    for(int L=0; L<NLAYER; ++L){ attention(m, h, seq, L); moe(m, h, seq, L); dump_h(h, seq, L+1); }
-    // final norm on last token + lm_head (tied embeddings) + softcap
-    float* hl; CU(cudaMalloc(&hl,H*4));
-    rmsnorm(hl, h+(size_t)(seq-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"), 1, H, EPS, 0);
-    float* dlog; CU(cudaMalloc(&dlog,(size_t)VOCAB*4));
-    k_lmhead<<<VOCAB,256>>>(dlog, hl, m.dptr<const uint16_t*>("model.language_model.embed_tokens.weight"), H, VOCAB, SOFTCAP);
-    CU(cudaDeviceSynchronize());
-    std::vector<float> logits(VOCAB); CU(cudaMemcpy(logits.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
-    double mx=-1e30; for(float v:logits)mx=std::max(mx,(double)v); double Z=0; for(float v:logits)Z+=exp((double)v-mx);
-    std::vector<int> ord(VOCAB); for(int i=0;i<VOCAB;++i)ord[i]=i;
-    std::partial_sort(ord.begin(),ord.begin()+5,ord.end(),[&](int a,int b){return logits[a]>logits[b];});
-    printf("\ntop-5 next-token  (id : logit : logprob):\n");
-    for(int j=0;j<5;++j){ int id=ord[j]; double lp=(double)logits[id]-mx-log(Z); printf("  %6d : %8.4f : %8.4f\n",id,logits[id],lp); }
+    int NGEN = getenv("GEN")? atoi(getenv("GEN")) : 0;   // 0 => just print top-5 of next token
+    std::vector<int> sq = ids;
+    const char* embn="model.language_model.embed_tokens.weight";
+    for(int step=0; step<=NGEN; ++step){
+        seq = sq.size();
+        int* dids; CU(cudaMalloc(&dids,seq*4)); CU(cudaMemcpy(dids,sq.data(),seq*4,cudaMemcpyHostToDevice));
+        float* h; CU(cudaMalloc(&h,(size_t)seq*H*4));
+        k_embed<<<seq,256>>>(h, m.dptr<const uint16_t*>(embn), dids, seq, H, EMB_SCALE);
+        CU(cudaDeviceSynchronize());
+        if(step==0) dump_h(h, seq, 0);
+        for(int L=0; L<NLAYER; ++L){ attention(m, h, seq, L); moe(m, h, seq, L); if(step==0)dump_h(h,seq,L+1); }
+        float* hl; CU(cudaMalloc(&hl,H*4));
+        rmsnorm(hl, h+(size_t)(seq-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"), 1, H, EPS, 0);
+        float* dlog; CU(cudaMalloc(&dlog,(size_t)VOCAB*4));
+        k_lmhead<<<VOCAB,256>>>(dlog, hl, m.dptr<const uint16_t*>(embn), H, VOCAB, SOFTCAP);
+        CU(cudaDeviceSynchronize());
+        std::vector<float> logits(VOCAB); CU(cudaMemcpy(logits.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
+        int best=0; for(int i=1;i<VOCAB;++i) if(logits[i]>logits[best]) best=i;
+        if(step<NGEN){ printf("%d ",best); fflush(stdout); sq.push_back(best); }
+        else {
+            double mx=-1e30; for(float v:logits)mx=std::max(mx,(double)v); double Z=0; for(float v:logits)Z+=exp((double)v-mx);
+            std::vector<int> ord(VOCAB); for(int i=0;i<VOCAB;++i)ord[i]=i;
+            std::partial_sort(ord.begin(),ord.begin()+5,ord.end(),[&](int a,int b){return logits[a]>logits[b];});
+            printf("\ntop-5 next-token  (id : logit : logprob):\n");
+            for(int j=0;j<5;++j){ int id=ord[j]; double lp=(double)logits[id]-mx-log(Z); printf("  %6d : %8.4f : %8.4f\n",id,logits[id],lp); }
+        }
+        cudaFree(dids);cudaFree(h);cudaFree(hl);cudaFree(dlog);
+        if(step<NGEN && (best==1||best==106)) break;   // EOS / end-of-turn
+    }
     return 0;
 }
