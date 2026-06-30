@@ -1,0 +1,488 @@
+{
+  "id": "multiturn_002",
+  "category": "multi_turn",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Define a haiku."
+    },
+    {
+      "role": "assistant",
+      "content": "A haiku is a traditional Japanese poem of three lines with a 5-7-5 syllable pattern, often about nature."
+    },
+    {
+      "role": "user",
+      "content": "Now write one about GPUs."
+    }
+  ],
+  "max_tokens": 96,
+  "content": "Silicon and light,\nParallel paths of power,\nRender worlds in flight.",
+  "n_completion_tokens": 17,
+  "tokens": [
+    {
+      "token": "Silicon",
+      "logprob": -0.08760546892881393,
+      "top": [
+        {
+          "token": "Silicon",
+          "logprob": -0.08760546892881393
+        },
+        {
+          "token": "Parallel",
+          "logprob": -3.4001054763793945
+        },
+        {
+          "token": "Thousands",
+          "logprob": -4.0251054763793945
+        },
+        {
+          "token": "Millions",
+          "logprob": -4.2751054763793945
+        },
+        {
+          "token": "C",
+          "logprob": -5.3376054763793945
+        }
+      ]
+    },
+    {
+      "token": " and",
+      "logprob": -0.09443200379610062,
+      "top": [
+        {
+          "token": " and",
+          "logprob": -0.09443200379610062
+        },
+        {
+          "token": " circuits",
+          "logprob": -4.2194318771362305
+        },
+        {
+          "token": " cores",
+          "logprob": -4.5944318771362305
+        },
+        {
+          "token": " heart",
+          "logprob": -4.8444318771362305
+        },
+        {
+          "token": " pathways",
+          "logprob": -5.2194318771362305
+        }
+      ]
+    },
+    {
+      "token": " light",
+      "logprob": -0.05158071592450142,
+      "top": [
+        {
+          "token": " light",
+          "logprob": -0.05158071592450142
+        },
+        {
+          "token": " heat",
+          "logprob": -4.239080905914307
+        },
+        {
+          "token": " cores",
+          "logprob": -4.364080905914307
+        },
+        {
+          "token": " power",
+          "logprob": -4.551580905914307
+        },
+        {
+          "token": " core",
+          "logprob": -5.676580905914307
+        }
+      ]
+    },
+    {
+      "token": ",",
+      "logprob": -1.1920928244535389e-07,
+      "top": [
+        {
+          "token": ",",
+          "logprob": -1.1920928244535389e-07
+        },
+        {
+          "token": " (",
+          "logprob": -16.40625
+        },
+        {
+          "token": ",$",
+          "logprob": -19.46875
+        },
+        {
+          "token": "\n",
+          "logprob": -19.53125
+        },
+        {
+          "token": ",<",
+          "logprob": -19.78125
+        }
+      ]
+    },
+    {
+      "token": "\n",
+      "logprob": -0.0002379134384682402,
+      "top": [
+        {
+          "token": "\n",
+          "logprob": -0.0002379134384682402
+        },
+        {
+          "token": " ",
+          "logprob": -8.437737464904785
+        },
+        {
+          "token": " (",
+          "logprob": -11.000237464904785
+        },
+        {
+          "token": "  ",
+          "logprob": -13.062737464904785
+        },
+        {
+          "token": "    ",
+          "logprob": -14.312737464904785
+        }
+      ]
+    },
+    {
+      "token": "Parallel",
+      "logprob": -0.7085648775100708,
+      "top": [
+        {
+          "token": "Parallel",
+          "logprob": -0.7085648775100708
+        },
+        {
+          "token": "Processing",
+          "logprob": -1.5835648775100708
+        },
+        {
+          "token": "Millions",
+          "logprob": -2.5210647583007812
+        },
+        {
+          "token": "Calcul",
+          "logprob": -2.9585647583007812
+        },
+        {
+          "token": "Calculating",
+          "logprob": -3.3335647583007812
+        }
+      ]
+    },
+    {
+      "token": " paths",
+      "logprob": -0.38771456480026245,
+      "top": [
+        {
+          "token": " paths",
+          "logprob": -0.38771456480026245
+        },
+        {
+          "token": " math",
+          "logprob": -2.0127146244049072
+        },
+        {
+          "token": " tasks",
+          "logprob": -2.1377146244049072
+        },
+        {
+          "token": " processing",
+          "logprob": -3.7002146244049072
+        },
+        {
+          "token": " power",
+          "logprob": -4.075214385986328
+        }
+      ]
+    },
+    {
+      "token": " of",
+      "logprob": -1.0670994520187378,
+      "top": [
+        {
+          "token": " of",
+          "logprob": -1.0670994520187378
+        },
+        {
+          "token": " process",
+          "logprob": -1.7545994520187378
+        },
+        {
+          "token": " processing",
+          "logprob": -2.3170995712280273
+        },
+        {
+          "token": " compute",
+          "logprob": -2.3170995712280273
+        },
+        {
+          "token": " through",
+          "logprob": -2.5670995712280273
+        }
+      ]
+    },
+    {
+      "token": " power",
+      "logprob": -0.23834870755672455,
+      "top": [
+        {
+          "token": " power",
+          "logprob": -0.23834870755672455
+        },
+        {
+          "token": " logic",
+          "logprob": -2.2383487224578857
+        },
+        {
+          "token": " pure",
+          "logprob": -2.9258487224578857
+        },
+        {
+          "token": " math",
+          "logprob": -3.4258487224578857
+        },
+        {
+          "token": " data",
+          "logprob": -4.988348484039307
+        }
+      ]
+    },
+    {
+      "token": ",",
+      "logprob": -2.3841830625315197e-06,
+      "top": [
+        {
+          "token": ",",
+          "logprob": -2.3841830625315197e-06
+        },
+        {
+          "token": "—",
+          "logprob": -14.437501907348633
+        },
+        {
+          "token": "'",
+          "logprob": -15.125001907348633
+        },
+        {
+          "token": ";",
+          "logprob": -15.625001907348633
+        },
+        {
+          "token": ":",
+          "logprob": -16.187501907348633
+        }
+      ]
+    },
+    {
+      "token": "\n",
+      "logprob": -7.629365427419543e-06,
+      "top": [
+        {
+          "token": "\n",
+          "logprob": -7.629365427419543e-06
+        },
+        {
+          "token": " ",
+          "logprob": -11.937507629394531
+        },
+        {
+          "token": "  ",
+          "logprob": -14.187507629394531
+        },
+        {
+          "token": " enough",
+          "logprob": -15.843757629394531
+        },
+        {
+          "token": "    ",
+          "logprob": -15.937507629394531
+        }
+      ]
+    },
+    {
+      "token": "Render",
+      "logprob": -0.7296344637870789,
+      "top": [
+        {
+          "token": "Render",
+          "logprob": -0.7296344637870789
+        },
+        {
+          "token": "Pixels",
+          "logprob": -1.7296345233917236
+        },
+        {
+          "token": "Rendering",
+          "logprob": -1.7296345233917236
+        },
+        {
+          "token": "Cycles",
+          "logprob": -3.6671345233917236
+        },
+        {
+          "token": "Worlds",
+          "logprob": -3.6671345233917236
+        }
+      ]
+    },
+    {
+      "token": " worlds",
+      "logprob": -0.11953668296337128,
+      "top": [
+        {
+          "token": " worlds",
+          "logprob": -0.11953668296337128
+        },
+        {
+          "token": "ed",
+          "logprob": -2.6195366382598877
+        },
+        {
+          "token": " every",
+          "logprob": -3.6820366382598877
+        },
+        {
+          "token": " the",
+          "logprob": -4.744536876678467
+        },
+        {
+          "token": " world",
+          "logprob": -6.307036876678467
+        }
+      ]
+    },
+    {
+      "token": " in",
+      "logprob": -0.1262393295764923,
+      "top": [
+        {
+          "token": " in",
+          "logprob": -0.1262393295764923
+        },
+        {
+          "token": " anew",
+          "logprob": -2.87623929977417
+        },
+        {
+          "token": " unseen",
+          "logprob": -3.12623929977417
+        },
+        {
+          "token": " of",
+          "logprob": -5.06373929977417
+        },
+        {
+          "token": " from",
+          "logprob": -5.50123929977417
+        }
+      ]
+    },
+    {
+      "token": " flight",
+      "logprob": -0.7091807126998901,
+      "top": [
+        {
+          "token": " flight",
+          "logprob": -0.7091807126998901
+        },
+        {
+          "token": " bloom",
+          "logprob": -1.4591807126998901
+        },
+        {
+          "token": " sight",
+          "logprob": -1.7091807126998901
+        },
+        {
+          "token": " flux",
+          "logprob": -3.3966808319091797
+        },
+        {
+          "token": " glass",
+          "logprob": -3.5216808319091797
+        }
+      ]
+    },
+    {
+      "token": ".",
+      "logprob": -1.1920928244535389e-07,
+      "top": [
+        {
+          "token": ".",
+          "logprob": -1.1920928244535389e-07
+        },
+        {
+          "token": "s",
+          "logprob": -18.125
+        },
+        {
+          "token": " much",
+          "logprob": -18.5625
+        },
+        {
+          "token": " soon",
+          "logprob": -18.75
+        },
+        {
+          "token": "o",
+          "logprob": -18.84375
+        }
+      ]
+    },
+    {
+      "token": "<turn|>",
+      "logprob": -3.576278118089249e-07,
+      "top": [
+        {
+          "token": "<turn|>",
+          "logprob": -3.576278118089249e-07
+        },
+        {
+          "token": "of",
+          "logprob": -16.5
+        },
+        {
+          "token": "turn",
+          "logprob": -17.0625
+        },
+        {
+          "token": " perforated",
+          "logprob": -17.3125
+        },
+        {
+          "token": "运动",
+          "logprob": -17.375
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 60,
+    "total_tokens": 77,
+    "completion_tokens": 17,
+    "prompt_tokens_details": null
+  },
+  "timing": {
+    "wall_s": 1.1489,
+    "ttft_s": 0.2128,
+    "stream_wall_s": 1.1275,
+    "decode_tok_s": 14.8
+  },
+  "dflash": {
+    "drafts": 11.0,
+    "draft_tokens": 165.0,
+    "accepted_tokens": 6.0,
+    "mean_accepted_per_draft": 0.5454545454545454,
+    "draft_acceptance_rate": 0.03636363636363636,
+    "per_position": {
+      "num_accepted_tokens_per_pos_total_pos0": 3.0,
+      "num_accepted_tokens_per_pos_total_pos1": 3.0
+    }
+  }
+}

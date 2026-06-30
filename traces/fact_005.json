@@ -1,0 +1,381 @@
+{
+  "id": "fact_005",
+  "category": "short_factual",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Who wrote the play Hamlet?"
+    }
+  ],
+  "max_tokens": 16,
+  "content": "The play *Hamlet* was written by **William Shakespeare**.",
+  "n_completion_tokens": 13,
+  "tokens": [
+    {
+      "token": "The",
+      "logprob": -0.43138551712036133,
+      "top": [
+        {
+          "token": "The",
+          "logprob": -0.43138551712036133
+        },
+        {
+          "token": "**",
+          "logprob": -1.0563855171203613
+        },
+        {
+          "token": "William",
+          "logprob": -6.056385517120361
+        },
+        {
+          "token": "***",
+          "logprob": -8.618885040283203
+        },
+        {
+          "token": "*",
+          "logprob": -9.618885040283203
+        }
+      ]
+    },
+    {
+      "token": " play",
+      "logprob": -1.3589766240329482e-05,
+      "top": [
+        {
+          "token": " play",
+          "logprob": -1.3589766240329482e-05
+        },
+        {
+          "token": " playwright",
+          "logprob": -11.31251335144043
+        },
+        {
+          "token": " plays",
+          "logprob": -14.12501335144043
+        },
+        {
+          "token": "play",
+          "logprob": -15.71876335144043
+        },
+        {
+          "token": " tragedy",
+          "logprob": -15.87501335144043
+        }
+      ]
+    },
+    {
+      "token": " *",
+      "logprob": -0.0006792622152715921,
+      "top": [
+        {
+          "token": " *",
+          "logprob": -0.0006792622152715921
+        },
+        {
+          "token": " **",
+          "logprob": -7.3131794929504395
+        },
+        {
+          "token": "-",
+          "logprob": -11.563179016113281
+        },
+        {
+          "token": " is",
+          "logprob": -14.375679016113281
+        },
+        {
+          "token": " ***",
+          "logprob": -14.500679016113281
+        }
+      ]
+    },
+    {
+      "token": "Hamlet",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "Hamlet",
+          "logprob": 0.0
+        },
+        {
+          "token": " Hamlet",
+          "logprob": -17.78125
+        },
+        {
+          "token": "Ham",
+          "logprob": -18.03125
+        },
+        {
+          "token": "The",
+          "logprob": -19.3125
+        },
+        {
+          "token": "Hamilton",
+          "logprob": -19.53125
+        }
+      ]
+    },
+    {
+      "token": "*",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "*",
+          "logprob": 0.0
+        },
+        {
+          "token": "*,",
+          "logprob": -19.4765625
+        },
+        {
+          "token": "*'",
+          "logprob": -20.734375
+        },
+        {
+          "token": "'",
+          "logprob": -21.453125
+        },
+        {
+          "token": "***",
+          "logprob": -22.0234375
+        }
+      ]
+    },
+    {
+      "token": " was",
+      "logprob": -2.6464111215318553e-05,
+      "top": [
+        {
+          "token": " was",
+          "logprob": -2.6464111215318553e-05
+        },
+        {
+          "token": "-",
+          "logprob": -10.65627670288086
+        },
+        {
+          "token": " is",
+          "logprob": -13.09377670288086
+        },
+        {
+          "token": " (",
+          "logprob": -15.24416732788086
+        },
+        {
+          "token": "를",
+          "logprob": -16.32815170288086
+        }
+      ]
+    },
+    {
+      "token": " written",
+      "logprob": -1.4305104514278355e-06,
+      "top": [
+        {
+          "token": " written",
+          "logprob": -1.4305104514278355e-06
+        },
+        {
+          "token": " wrote",
+          "logprob": -13.484375953674316
+        },
+        {
+          "token": " actually",
+          "logprob": -19.140626907348633
+        },
+        {
+          "token": " been",
+          "logprob": -19.281251907348633
+        },
+        {
+          "token": " much",
+          "logprob": -19.609376907348633
+        }
+      ]
+    },
+    {
+      "token": " by",
+      "logprob": -3.576278118089249e-07,
+      "top": [
+        {
+          "token": " by",
+          "logprob": -3.576278118089249e-07
+        },
+        {
+          "token": " (",
+          "logprob": -15.515625
+        },
+        {
+          "token": " through",
+          "logprob": -15.59375
+        },
+        {
+          "token": "s",
+          "logprob": -18.6171875
+        },
+        {
+          "token": " English",
+          "logprob": -19.046875
+        }
+      ]
+    },
+    {
+      "token": " **",
+      "logprob": -0.0016011287225410342,
+      "top": [
+        {
+          "token": " **",
+          "logprob": -0.0016011287225410342
+        },
+        {
+          "token": " the",
+          "logprob": -6.439101219177246
+        },
+        {
+          "token": " way",
+          "logprob": -14.126601219177246
+        },
+        {
+          "token": " English",
+          "logprob": -14.626601219177246
+        },
+        {
+          "token": " William",
+          "logprob": -15.095351219177246
+        }
+      ]
+    },
+    {
+      "token": "William",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "William",
+          "logprob": 0.0
+        },
+        {
+          "token": " William",
+          "logprob": -18.2646484375
+        },
+        {
+          "token": " विलियम",
+          "logprob": -19.8046875
+        },
+        {
+          "token": "Williams",
+          "logprob": -23.84375
+        },
+        {
+          "token": "윌",
+          "logprob": -24.28125
+        }
+      ]
+    },
+    {
+      "token": " Shakespeare",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": " Shakespeare",
+          "logprob": 0.0
+        },
+        {
+          "token": " Shake",
+          "logprob": -17.90625
+        },
+        {
+          "token": " Sh",
+          "logprob": -18.75
+        },
+        {
+          "token": " She",
+          "logprob": -19.0625
+        },
+        {
+          "token": " Shak",
+          "logprob": -19.21875
+        }
+      ]
+    },
+    {
+      "token": "**.",
+      "logprob": -2.3841830625315197e-06,
+      "top": [
+        {
+          "token": "**.",
+          "logprob": -2.3841830625315197e-06
+        },
+        {
+          "token": "**",
+          "logprob": -13.125001907348633
+        },
+        {
+          "token": "**,",
+          "logprob": -15.046876907348633
+        },
+        {
+          "token": ".**",
+          "logprob": -17.554689407348633
+        },
+        {
+          "token": "'",
+          "logprob": -18.655763626098633
+        }
+      ]
+    },
+    {
+      "token": "<turn|>",
+      "logprob": -0.00048530244384892285,
+      "top": [
+        {
+          "token": "<turn|>",
+          "logprob": -0.00048530244384892285
+        },
+        {
+          "token": " It",
+          "logprob": -7.750485420227051
+        },
+        {
+          "token": " Most",
+          "logprob": -11.12548542022705
+        },
+        {
+          "token": " While",
+          "logprob": -11.87548542022705
+        },
+        {
+          "token": " He",
+          "logprob": -12.68798542022705
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 19,
+    "total_tokens": 32,
+    "completion_tokens": 13,
+    "prompt_tokens_details": null
+  },
+  "timing": {
+    "wall_s": 0.5224,
+    "ttft_s": 0.1914,
+    "stream_wall_s": 0.514,
+    "decode_tok_s": 24.88
+  },
+  "dflash": {
+    "drafts": 4.0,
+    "draft_tokens": 60.0,
+    "accepted_tokens": 9.0,
+    "mean_accepted_per_draft": 2.25,
+    "draft_acceptance_rate": 0.15,
+    "per_position": {
+      "num_accepted_tokens_per_pos_total_pos0": 3.0,
+      "num_accepted_tokens_per_pos_total_pos1": 1.0,
+      "num_accepted_tokens_per_pos_total_pos2": 1.0,
+      "num_accepted_tokens_per_pos_total_pos3": 1.0,
+      "num_accepted_tokens_per_pos_total_pos4": 1.0,
+      "num_accepted_tokens_per_pos_total_pos5": 1.0,
+      "num_accepted_tokens_per_pos_total_pos6": 1.0
+    }
+  }
+}

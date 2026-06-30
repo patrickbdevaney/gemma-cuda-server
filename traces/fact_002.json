@@ -1,0 +1,274 @@
+{
+  "id": "fact_002",
+  "category": "short_factual",
+  "messages": [
+    {
+      "role": "user",
+      "content": "How many legs does a spider have?"
+    }
+  ],
+  "max_tokens": 16,
+  "content": "A spider has **8** legs.",
+  "n_completion_tokens": 9,
+  "tokens": [
+    {
+      "token": "A",
+      "logprob": -2.0265558760002023e-06,
+      "top": [
+        {
+          "token": "A",
+          "logprob": -2.0265558760002023e-06
+        },
+        {
+          "token": "Most",
+          "logprob": -13.718751907348633
+        },
+        {
+          "token": "An",
+          "logprob": -14.406251907348633
+        },
+        {
+          "token": "Sp",
+          "logprob": -16.093751907348633
+        },
+        {
+          "token": "All",
+          "logprob": -16.281251907348633
+        }
+      ]
+    },
+    {
+      "token": " spider",
+      "logprob": -1.5258672647178173e-05,
+      "top": [
+        {
+          "token": " spider",
+          "logprob": -1.5258672647178173e-05
+        },
+        {
+          "token": " typical",
+          "logprob": -11.406265258789062
+        },
+        {
+          "token": " own",
+          "logprob": -13.828140258789062
+        },
+        {
+          "token": " most",
+          "logprob": -14.000015258789062
+        },
+        {
+          "token": " standard",
+          "logprob": -14.750015258789062
+        }
+      ]
+    },
+    {
+      "token": " has",
+      "logprob": -4.458328112377785e-05,
+      "top": [
+        {
+          "token": " has",
+          "logprob": -4.458328112377785e-05
+        },
+        {
+          "token": " typically",
+          "logprob": -10.062544822692871
+        },
+        {
+          "token": "-",
+          "logprob": -13.781294822692871
+        },
+        {
+          "token": " much",
+          "logprob": -15.312544822692871
+        },
+        {
+          "token": " most",
+          "logprob": -15.781294822692871
+        }
+      ]
+    },
+    {
+      "token": " **",
+      "logprob": -4.768370445162873e-07,
+      "top": [
+        {
+          "token": " **",
+          "logprob": -4.768370445162873e-07
+        },
+        {
+          "token": " typically",
+          "logprob": -15.6875
+        },
+        {
+          "token": " ",
+          "logprob": -15.75
+        },
+        {
+          "token": " most",
+          "logprob": -17.65625
+        },
+        {
+          "token": " much",
+          "logprob": -17.9375
+        }
+      ]
+    },
+    {
+      "token": "8",
+      "logprob": -0.0009114163694903255,
+      "top": [
+        {
+          "token": "8",
+          "logprob": -0.0009114163694903255
+        },
+        {
+          "token": "eight",
+          "logprob": -7.000911235809326
+        },
+        {
+          "token": "1",
+          "logprob": -18.047786712646484
+        },
+        {
+          "token": "6",
+          "logprob": -18.969661712646484
+        },
+        {
+          "token": " eight",
+          "logprob": -19.063411712646484
+        }
+      ]
+    },
+    {
+      "token": "**",
+      "logprob": -0.00462047103792429,
+      "top": [
+        {
+          "token": "**",
+          "logprob": -0.00462047103792429
+        },
+        {
+          "token": " legs",
+          "logprob": -5.379620552062988
+        },
+        {
+          "token": " (",
+          "logprob": -15.817120552062988
+        },
+        {
+          "token": " much",
+          "logprob": -15.879620552062988
+        },
+        {
+          "token": " toes",
+          "logprob": -19.504619598388672
+        }
+      ]
+    },
+    {
+      "token": " legs",
+      "logprob": -2.3841855067985307e-07,
+      "top": [
+        {
+          "token": " legs",
+          "logprob": -2.3841855067985307e-07
+        },
+        {
+          "token": " (",
+          "logprob": -15.0859375
+        },
+        {
+          "token": " much",
+          "logprob": -17.3671875
+        },
+        {
+          "token": "0",
+          "logprob": -17.6953125
+        },
+        {
+          "token": " leg",
+          "logprob": -18.34375
+        }
+      ]
+    },
+    {
+      "token": ".",
+      "logprob": -2.9802276912960224e-06,
+      "top": [
+        {
+          "token": ".",
+          "logprob": -2.9802276912960224e-06
+        },
+        {
+          "token": " (",
+          "logprob": -14.18750286102295
+        },
+        {
+          "token": "s",
+          "logprob": -15.31250286102295
+        },
+        {
+          "token": " (**",
+          "logprob": -15.95312786102295
+        },
+        {
+          "token": " located",
+          "logprob": -16.500003814697266
+        }
+      ]
+    },
+    {
+      "token": "<turn|>",
+      "logprob": -1.7881377516459906e-06,
+      "top": [
+        {
+          "token": "<turn|>",
+          "logprob": -1.7881377516459906e-06
+        },
+        {
+          "token": "of",
+          "logprob": -14.375001907348633
+        },
+        {
+          "token": "_",
+          "logprob": -15.000001907348633
+        },
+        {
+          "token": "运动",
+          "logprob": -16.062501907348633
+        },
+        {
+          "token": "归",
+          "logprob": -16.500001907348633
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 21,
+    "total_tokens": 30,
+    "completion_tokens": 9,
+    "prompt_tokens_details": null
+  },
+  "timing": {
+    "wall_s": 0.3647,
+    "ttft_s": 0.1954,
+    "stream_wall_s": 0.3652,
+    "decode_tok_s": 24.68
+  },
+  "dflash": {
+    "drafts": 2.0,
+    "draft_tokens": 30.0,
+    "accepted_tokens": 7.0,
+    "mean_accepted_per_draft": 3.5,
+    "draft_acceptance_rate": 0.23333333333333334,
+    "per_position": {
+      "num_accepted_tokens_per_pos_total_pos0": 2.0,
+      "num_accepted_tokens_per_pos_total_pos1": 2.0,
+      "num_accepted_tokens_per_pos_total_pos2": 2.0,
+      "num_accepted_tokens_per_pos_total_pos3": 1.0
+    }
+  }
+}

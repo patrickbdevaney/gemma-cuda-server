@@ -1,0 +1,253 @@
+{
+  "id": "fact_004",
+  "category": "short_factual",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the chemical symbol for gold?"
+    }
+  ],
+  "max_tokens": 8,
+  "content": "The chemical symbol for gold is **Au",
+  "n_completion_tokens": 8,
+  "tokens": [
+    {
+      "token": "The",
+      "logprob": -1.0609570381348021e-05,
+      "top": [
+        {
+          "token": "The",
+          "logprob": -1.0609570381348021e-05
+        },
+        {
+          "token": "the",
+          "logprob": -11.75001049041748
+        },
+        {
+          "token": "**",
+          "logprob": -13.37501049041748
+        },
+        {
+          "token": "$\\",
+          "logprob": -16.304698944091797
+        },
+        {
+          "token": "out",
+          "logprob": -16.367198944091797
+        }
+      ]
+    },
+    {
+      "token": " chemical",
+      "logprob": -1.1920928244535389e-07,
+      "top": [
+        {
+          "token": " chemical",
+          "logprob": -1.1920928244535389e-07
+        },
+        {
+          "token": " रासायनिक",
+          "logprob": -16.5703125
+        },
+        {
+          "token": " хими",
+          "logprob": -17.390625
+        },
+        {
+          "token": "化学",
+          "logprob": -17.734375
+        },
+        {
+          "token": " symbol",
+          "logprob": -19.25
+        }
+      ]
+    },
+    {
+      "token": " symbol",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": " symbol",
+          "logprob": 0.0
+        },
+        {
+          "token": " प्रतीक",
+          "logprob": -20.125
+        },
+        {
+          "token": " abbreviation",
+          "logprob": -20.4375
+        },
+        {
+          "token": " symbols",
+          "logprob": -20.9375
+        },
+        {
+          "token": " символ",
+          "logprob": -21.1875
+        }
+      ]
+    },
+    {
+      "token": " for",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": " for",
+          "logprob": 0.0
+        },
+        {
+          "token": " move",
+          "logprob": -18.677734375
+        },
+        {
+          "token": " (",
+          "logprob": -18.94189453125
+        },
+        {
+          "token": "/",
+          "logprob": -19.0830078125
+        },
+        {
+          "token": " or",
+          "logprob": -19.5546875
+        }
+      ]
+    },
+    {
+      "token": " gold",
+      "logprob": -1.311301275563892e-06,
+      "top": [
+        {
+          "token": " gold",
+          "logprob": -1.311301275563892e-06
+        },
+        {
+          "token": " Gold",
+          "logprob": -14.625000953674316
+        },
+        {
+          "token": " **",
+          "logprob": -15.031250953674316
+        },
+        {
+          "token": " way",
+          "logprob": -16.656251907348633
+        },
+        {
+          "token": " golden",
+          "logprob": -16.968751907348633
+        }
+      ]
+    },
+    {
+      "token": " is",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": " is",
+          "logprob": 0.0
+        },
+        {
+          "token": " Is",
+          "logprob": -17.3125
+        },
+        {
+          "token": " de",
+          "logprob": -19.8671875
+        },
+        {
+          "token": " هو",
+          "logprob": -20.28125
+        },
+        {
+          "token": " index",
+          "logprob": -20.625
+        }
+      ]
+    },
+    {
+      "token": " **",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": " **",
+          "logprob": 0.0
+        },
+        {
+          "token": "  ",
+          "logprob": -20.0390625
+        },
+        {
+          "token": " way",
+          "logprob": -23.5234375
+        },
+        {
+          "token": " $\\",
+          "logprob": -23.8359375
+        },
+        {
+          "token": " been",
+          "logprob": -23.8515625
+        }
+      ]
+    },
+    {
+      "token": "Au",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "Au",
+          "logprob": 0.0
+        },
+        {
+          "token": " Au",
+          "logprob": -19.75
+        },
+        {
+          "token": "$\\",
+          "logprob": -20.15625
+        },
+        {
+          "token": "au",
+          "logprob": -22.0
+        },
+        {
+          "token": "Aut",
+          "logprob": -23.75
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 21,
+    "total_tokens": 29,
+    "completion_tokens": 8,
+    "prompt_tokens_details": null
+  },
+  "timing": {
+    "wall_s": 0.2898,
+    "ttft_s": 0.1894,
+    "stream_wall_s": 0.2783,
+    "decode_tok_s": 27.61
+  },
+  "dflash": {
+    "drafts": 1.0,
+    "draft_tokens": 15.0,
+    "accepted_tokens": 9.0,
+    "mean_accepted_per_draft": 9.0,
+    "draft_acceptance_rate": 0.6,
+    "per_position": {
+      "num_accepted_tokens_per_pos_total_pos0": 1.0,
+      "num_accepted_tokens_per_pos_total_pos1": 1.0,
+      "num_accepted_tokens_per_pos_total_pos2": 1.0,
+      "num_accepted_tokens_per_pos_total_pos3": 1.0,
+      "num_accepted_tokens_per_pos_total_pos4": 1.0,
+      "num_accepted_tokens_per_pos_total_pos5": 1.0,
+      "num_accepted_tokens_per_pos_total_pos6": 1.0,
+      "num_accepted_tokens_per_pos_total_pos7": 1.0,
+      "num_accepted_tokens_per_pos_total_pos8": 1.0
+    }
+  }
+}

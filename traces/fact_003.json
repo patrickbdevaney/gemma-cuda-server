@@ -1,0 +1,353 @@
+{
+  "id": "fact_003",
+  "category": "short_factual",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What year did World War II end?"
+    }
+  ],
+  "max_tokens": 16,
+  "content": "World War II ended in **1945**.",
+  "n_completion_tokens": 12,
+  "tokens": [
+    {
+      "token": "World",
+      "logprob": -1.5497195136049413e-06,
+      "top": [
+        {
+          "token": "World",
+          "logprob": -1.5497195136049413e-06
+        },
+        {
+          "token": "**",
+          "logprob": -13.500001907348633
+        },
+        {
+          "token": "The",
+          "logprob": -16.750001907348633
+        },
+        {
+          "token": "Depending",
+          "logprob": -16.968751907348633
+        },
+        {
+          "token": "WORLD",
+          "logprob": -18.062501907348633
+        }
+      ]
+    },
+    {
+      "token": " War",
+      "logprob": -8.332382276421413e-05,
+      "top": [
+        {
+          "token": " War",
+          "logprob": -8.332382276421413e-05
+        },
+        {
+          "token": " II",
+          "logprob": -10.625082969665527
+        },
+        {
+          "token": ".",
+          "logprob": -10.875082969665527
+        },
+        {
+          "token": "::",
+          "logprob": -11.312582969665527
+        },
+        {
+          "token": " war",
+          "logprob": -11.562582969665527
+        }
+      ]
+    },
+    {
+      "token": " II",
+      "logprob": -1.1920928244535389e-07,
+      "top": [
+        {
+          "token": " II",
+          "logprob": -1.1920928244535389e-07
+        },
+        {
+          "token": " even",
+          "logprob": -16.625
+        },
+        {
+          "token": "-",
+          "logprob": -17.5625
+        },
+        {
+          "token": " much",
+          "logprob": -18.1953125
+        },
+        {
+          "token": " ",
+          "logprob": -18.484375
+        }
+      ]
+    },
+    {
+      "token": " ended",
+      "logprob": -0.0005984899471513927,
+      "top": [
+        {
+          "token": " ended",
+          "logprob": -0.0005984899471513927
+        },
+        {
+          "token": " officially",
+          "logprob": -8.000598907470703
+        },
+        {
+          "token": " end",
+          "logprob": -8.250598907470703
+        },
+        {
+          "token": " formally",
+          "logprob": -14.594348907470703
+        },
+        {
+          "token": " effectively",
+          "logprob": -14.750598907470703
+        }
+      ]
+    },
+    {
+      "token": " in",
+      "logprob": -9.536738616588991e-07,
+      "top": [
+        {
+          "token": " in",
+          "logprob": -9.536738616588991e-07
+        },
+        {
+          "token": " officially",
+          "logprob": -14.812500953674316
+        },
+        {
+          "token": " formally",
+          "logprob": -15.593750953674316
+        },
+        {
+          "token": " for",
+          "logprob": -16.03125
+        },
+        {
+          "token": " much",
+          "logprob": -16.625
+        }
+      ]
+    },
+    {
+      "token": " **",
+      "logprob": -2.3841830625315197e-06,
+      "top": [
+        {
+          "token": " **",
+          "logprob": -2.3841830625315197e-06
+        },
+        {
+          "token": " ",
+          "logprob": -13.562501907348633
+        },
+        {
+          "token": " the",
+          "logprob": -14.968751907348633
+        },
+        {
+          "token": " both",
+          "logprob": -15.062501907348633
+        },
+        {
+          "token": "-",
+          "logprob": -15.468751907348633
+        }
+      ]
+    },
+    {
+      "token": "1",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "1",
+          "logprob": 0.0
+        },
+        {
+          "token": "the",
+          "logprob": -21.125
+        },
+        {
+          "token": "year",
+          "logprob": -21.1875
+        },
+        {
+          "token": "{",
+          "logprob": -21.21875
+        },
+        {
+          "token": "\\\\",
+          "logprob": -21.265625
+        }
+      ]
+    },
+    {
+      "token": "9",
+      "logprob": -9.536738616588991e-07,
+      "top": [
+        {
+          "token": "9",
+          "logprob": -9.536738616588991e-07
+        },
+        {
+          "token": "0",
+          "logprob": -14.625000953674316
+        },
+        {
+          "token": "8",
+          "logprob": -14.750000953674316
+        },
+        {
+          "token": "1",
+          "logprob": -16.0625
+        },
+        {
+          "token": "4",
+          "logprob": -17.625
+        }
+      ]
+    },
+    {
+      "token": "4",
+      "logprob": -3.576278118089249e-07,
+      "top": [
+        {
+          "token": "4",
+          "logprob": -3.576278118089249e-07
+        },
+        {
+          "token": "5",
+          "logprob": -16.03125
+        },
+        {
+          "token": "3",
+          "logprob": -16.46875
+        },
+        {
+          "token": "1",
+          "logprob": -17.21875
+        },
+        {
+          "token": "**",
+          "logprob": -17.4375
+        }
+      ]
+    },
+    {
+      "token": "5",
+      "logprob": -1.4305104514278355e-06,
+      "top": [
+        {
+          "token": "5",
+          "logprob": -1.4305104514278355e-06
+        },
+        {
+          "token": "1",
+          "logprob": -14.312500953674316
+        },
+        {
+          "token": "4",
+          "logprob": -14.625000953674316
+        },
+        {
+          "token": "6",
+          "logprob": -16.218751907348633
+        },
+        {
+          "token": "2",
+          "logprob": -16.281251907348633
+        }
+      ]
+    },
+    {
+      "token": "**.",
+      "logprob": -2.145764938177308e-06,
+      "top": [
+        {
+          "token": "**.",
+          "logprob": -2.145764938177308e-06
+        },
+        {
+          "token": "**",
+          "logprob": -13.218751907348633
+        },
+        {
+          "token": "**,",
+          "logprob": -15.390626907348633
+        },
+        {
+          "token": "-",
+          "logprob": -17.718751907348633
+        },
+        {
+          "token": ".**",
+          "logprob": -18.257814407348633
+        }
+      ]
+    },
+    {
+      "token": "<turn|>",
+      "logprob": -0.06221957504749298,
+      "top": [
+        {
+          "token": "<turn|>",
+          "logprob": -0.06221957504749298
+        },
+        {
+          "token": "\n\n",
+          "logprob": -2.8122196197509766
+        },
+        {
+          "token": " ",
+          "logprob": -8.312219619750977
+        },
+        {
+          "token": "_",
+          "logprob": -12.499719619750977
+        },
+        {
+          "token": "  ",
+          "logprob": -14.249719619750977
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 21,
+    "total_tokens": 33,
+    "completion_tokens": 12,
+    "prompt_tokens_details": null
+  },
+  "timing": {
+    "wall_s": 0.3767,
+    "ttft_s": 0.1976,
+    "stream_wall_s": 0.3723,
+    "decode_tok_s": 31.86
+  },
+  "dflash": {
+    "drafts": 2.0,
+    "draft_tokens": 30.0,
+    "accepted_tokens": 9.0,
+    "mean_accepted_per_draft": 4.5,
+    "draft_acceptance_rate": 0.3,
+    "per_position": {
+      "num_accepted_tokens_per_pos_total_pos0": 2.0,
+      "num_accepted_tokens_per_pos_total_pos1": 2.0,
+      "num_accepted_tokens_per_pos_total_pos2": 2.0,
+      "num_accepted_tokens_per_pos_total_pos3": 2.0,
+      "num_accepted_tokens_per_pos_total_pos4": 1.0
+    }
+  }
+}

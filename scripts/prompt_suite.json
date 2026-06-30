@@ -1,0 +1,23 @@
+{
+  "_comment": "Phase-1 ground-truth prompt suite for gemma4-cuda-server. Categories span the real agentic workload. Each entry is a single-turn user message unless 'messages' is given (multi-turn). Extend toward 50-100; this seed covers all categories.",
+  "prompts": [
+    {"id": "fact_001", "category": "short_factual", "messages": [{"role": "user", "content": "What is the capital of France? Answer in one word."}], "max_tokens": 8},
+    {"id": "fact_002", "category": "short_factual", "messages": [{"role": "user", "content": "How many legs does a spider have?"}], "max_tokens": 16},
+    {"id": "fact_003", "category": "short_factual", "messages": [{"role": "user", "content": "What year did World War II end?"}], "max_tokens": 16},
+    {"id": "fact_004", "category": "short_factual", "messages": [{"role": "user", "content": "What is the chemical symbol for gold?"}], "max_tokens": 8},
+    {"id": "fact_005", "category": "short_factual", "messages": [{"role": "user", "content": "Who wrote the play Hamlet?"}], "max_tokens": 16},
+    {"id": "reason_001", "category": "reasoning", "messages": [{"role": "user", "content": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost? Show your reasoning briefly."}], "max_tokens": 256},
+    {"id": "reason_002", "category": "reasoning", "messages": [{"role": "user", "content": "If a train travels 60 miles in 1.5 hours, what is its average speed in mph?"}], "max_tokens": 128},
+    {"id": "reason_003", "category": "reasoning", "messages": [{"role": "user", "content": "How many times does the letter r appear in the word strawberry?"}], "max_tokens": 64},
+    {"id": "code_001", "category": "code_gen", "messages": [{"role": "user", "content": "Write a Python function is_prime(n) that returns True if n is prime. Code only."}], "max_tokens": 256},
+    {"id": "code_002", "category": "code_gen", "messages": [{"role": "user", "content": "Write a Python function to compute the nth Fibonacci number iteratively. Code only."}], "max_tokens": 200},
+    {"id": "code_003", "category": "code_edit", "messages": [{"role": "user", "content": "This function has a bug:\n\ndef avg(xs):\n    return sum(xs) / len(xs) + 1\n\nFix it so it returns the arithmetic mean. Return only the corrected function."}], "max_tokens": 160},
+    {"id": "code_004", "category": "code_gen", "messages": [{"role": "user", "content": "Write a Python function flatten(nested) that flattens an arbitrarily nested list of integers into a flat list. Code only."}], "max_tokens": 220},
+    {"id": "explain_001", "category": "explanation", "messages": [{"role": "user", "content": "In one sentence, what is speculative decoding?"}], "max_tokens": 96},
+    {"id": "explain_002", "category": "explanation", "messages": [{"role": "user", "content": "Explain what a KV cache is in transformer inference, in two sentences."}], "max_tokens": 128},
+    {"id": "multiturn_001", "category": "multi_turn", "messages": [{"role": "user", "content": "I'm planning a Python CLI tool. What argument-parsing library should I use?"}, {"role": "assistant", "content": "For a Python CLI, the standard library's argparse is the most common choice; for richer ergonomics, click or typer are popular third-party options."}, {"role": "user", "content": "Show me a minimal argparse example with one positional argument called 'path'."}], "max_tokens": 200},
+    {"id": "multiturn_002", "category": "multi_turn", "messages": [{"role": "user", "content": "Define a haiku."}, {"role": "assistant", "content": "A haiku is a traditional Japanese poem of three lines with a 5-7-5 syllable pattern, often about nature."}, {"role": "user", "content": "Now write one about GPUs."}], "max_tokens": 96},
+    {"id": "toolish_001", "category": "agentic_format", "messages": [{"role": "user", "content": "You have a tool get_weather(city). The user asks: what's the weather in Tokyo? Describe exactly which tool call you would make and with what argument."}], "max_tokens": 128},
+    {"id": "longctx_001", "category": "long_context", "_build": "needle", "needle": "The launch code for project Bluefin is 7-ZULU-42.", "filler_repeats": 400, "question": "What is the launch code for project Bluefin? Answer with just the code.", "max_tokens": 24}
+  ]
+}

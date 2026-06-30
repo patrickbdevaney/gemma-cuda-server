@@ -1,0 +1,89 @@
+{
+  "id": "fact_001",
+  "category": "short_factual",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the capital of France? Answer in one word."
+    }
+  ],
+  "max_tokens": 8,
+  "content": "Paris",
+  "n_completion_tokens": 2,
+  "tokens": [
+    {
+      "token": "Paris",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "Paris",
+          "logprob": 0.0
+        },
+        {
+          "token": " Paris",
+          "logprob": -18.125
+        },
+        {
+          "token": "巴黎",
+          "logprob": -22.75
+        },
+        {
+          "token": "パリ",
+          "logprob": -24.0
+        },
+        {
+          "token": "paris",
+          "logprob": -24.3125
+        }
+      ]
+    },
+    {
+      "token": "<turn|>",
+      "logprob": -3.099436753473128e-06,
+      "top": [
+        {
+          "token": "<turn|>",
+          "logprob": -3.099436753473128e-06
+        },
+        {
+          "token": "运动",
+          "logprob": -14.12500286102295
+        },
+        {
+          "token": ".",
+          "logprob": -15.39062786102295
+        },
+        {
+          "token": "_",
+          "logprob": -15.53125286102295
+        },
+        {
+          "token": "of",
+          "logprob": -15.59375286102295
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 25,
+    "total_tokens": 27,
+    "completion_tokens": 2,
+    "prompt_tokens_details": null
+  },
+  "timing": {
+    "wall_s": 0.2054,
+    "ttft_s": 0.1836,
+    "stream_wall_s": 0.2507,
+    "decode_tok_s": 9.73
+  },
+  "dflash": {
+    "drafts": 1.0,
+    "draft_tokens": 15.0,
+    "accepted_tokens": 1.0,
+    "mean_accepted_per_draft": 1.0,
+    "draft_acceptance_rate": 0.06666666666666667,
+    "per_position": {
+      "num_accepted_tokens_per_pos_total_pos0": 1.0
+    }
+  }
+}

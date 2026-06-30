@@ -1,0 +1,238 @@
+{
+  "id": "longctx_001",
+  "category": "long_context",
+  "messages": "[needle-built, omitted]",
+  "max_tokens": 24,
+  "content": "7-ZULU-42",
+  "n_completion_tokens": 8,
+  "tokens": [
+    {
+      "token": "7",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "7",
+          "logprob": 0.0
+        },
+        {
+          "token": " ۷",
+          "logprob": -18.96875
+        },
+        {
+          "token": "৭",
+          "logprob": -20.125
+        },
+        {
+          "token": " ",
+          "logprob": -20.125
+        },
+        {
+          "token": "۷",
+          "logprob": -20.3125
+        }
+      ]
+    },
+    {
+      "token": "-",
+      "logprob": -8.344646857949556e-07,
+      "top": [
+        {
+          "token": "-",
+          "logprob": -8.344646857949556e-07
+        },
+        {
+          "token": "_",
+          "logprob": -14.187500953674316
+        },
+        {
+          "token": "–",
+          "logprob": -15.750000953674316
+        },
+        {
+          "token": "—",
+          "logprob": -18.125
+        },
+        {
+          "token": ".",
+          "logprob": -18.46875
+        }
+      ]
+    },
+    {
+      "token": "Z",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "Z",
+          "logprob": 0.0
+        },
+        {
+          "token": "ZE",
+          "logprob": -19.734375
+        },
+        {
+          "token": " Z",
+          "logprob": -20.375
+        },
+        {
+          "token": "ZEN",
+          "logprob": -20.625
+        },
+        {
+          "token": "З",
+          "logprob": -21.15625
+        }
+      ]
+    },
+    {
+      "token": "ULU",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "ULU",
+          "logprob": 0.0
+        },
+        {
+          "token": "ULA",
+          "logprob": -17.3125
+        },
+        {
+          "token": "ULO",
+          "logprob": -17.6875
+        },
+        {
+          "token": "UL",
+          "logprob": -20.5
+        },
+        {
+          "token": "URU",
+          "logprob": -23.3125
+        }
+      ]
+    },
+    {
+      "token": "-",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "-",
+          "logprob": 0.0
+        },
+        {
+          "token": "_",
+          "logprob": -19.375
+        },
+        {
+          "token": "–",
+          "logprob": -22.0625
+        },
+        {
+          "token": "st",
+          "logprob": -22.1953125
+        },
+        {
+          "token": "<turn|>",
+          "logprob": -22.99609375
+        }
+      ]
+    },
+    {
+      "token": "4",
+      "logprob": 0.0,
+      "top": [
+        {
+          "token": "4",
+          "logprob": 0.0
+        },
+        {
+          "token": "1",
+          "logprob": -20.625
+        },
+        {
+          "token": "_",
+          "logprob": -20.90625
+        },
+        {
+          "token": "<",
+          "logprob": -21.359375
+        },
+        {
+          "token": "<turn|>",
+          "logprob": -21.359375
+        }
+      ]
+    },
+    {
+      "token": "2",
+      "logprob": -4.768370445162873e-07,
+      "top": [
+        {
+          "token": "2",
+          "logprob": -4.768370445162873e-07
+        },
+        {
+          "token": "1",
+          "logprob": -14.6875
+        },
+        {
+          "token": "3",
+          "logprob": -17.65625
+        },
+        {
+          "token": "<turn|>",
+          "logprob": -18.59375
+        },
+        {
+          "token": " ",
+          "logprob": -19.375
+        }
+      ]
+    },
+    {
+      "token": "<turn|>",
+      "logprob": -2.3841855067985307e-07,
+      "top": [
+        {
+          "token": "<turn|>",
+          "logprob": -2.3841855067985307e-07
+        },
+        {
+          "token": "of",
+          "logprob": -16.40625
+        },
+        {
+          "token": "_",
+          "logprob": -16.6875
+        },
+        {
+          "token": ".",
+          "logprob": -18.8515625
+        },
+        {
+          "token": "Of",
+          "logprob": -19.078125
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 15249,
+    "total_tokens": 15257,
+    "completion_tokens": 8,
+    "prompt_tokens_details": null
+  },
+  "timing": {
+    "wall_s": 6.257,
+    "ttft_s": 0.2079,
+    "stream_wall_s": 0.5834,
+    "decode_tok_s": 1.28
+  },
+  "dflash": {
+    "drafts": 7.0,
+    "draft_tokens": 105.0,
+    "accepted_tokens": 0.0,
+    "mean_accepted_per_draft": 0.0,
+    "draft_acceptance_rate": 0.0,
+    "per_position": {}
+  }
+}
