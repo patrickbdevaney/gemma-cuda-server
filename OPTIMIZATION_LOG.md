@@ -19,3 +19,8 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
 
 ### [0] Baseline established
 - correctness: PASS | base 29.89 tok/s | CHAMPION (initial) | DFlash 30.58 predictable. Loop infra added.
+
+### [1] Device-argmax base-decode fast path
+- change: base decode was `k_lmhead -> cudaMemcpy 1MB logits D2H -> host argmax over 262144` every step;
+  added `ftok` path = `k_argmax<<<1>>>` on device + copy 1 int. Skips 1MB D2H + serial host argmax.
+- correctness: PASS | base 29.89 -> **30.73 tok/s (+2.8%)** | **CHAMPION** | clean isolated win.

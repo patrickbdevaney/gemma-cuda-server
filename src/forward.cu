@@ -470,7 +470,7 @@ int main(int argc,char**argv){
     const char* embn="model.language_model.embed_tokens.weight";
     // run mtok tokens at positions [base, base+mtok); fill logits_out for the LAST token; updates KV cache
     // per-position argmax (verify): for each of the mtok positions, target's greedy next-token
-    auto run=[&](const std::vector<int>& nids,int base,std::vector<float>& lo,float* taps=nullptr,std::vector<int>* allarg=nullptr){
+    auto run=[&](const std::vector<int>& nids,int base,std::vector<float>& lo,float* taps=nullptr,std::vector<int>* allarg=nullptr,int* ftok=nullptr){
         int mtok=nids.size(); bool big=mtok>MAXM;
         int* dids; float* h;
         if(big){ CU(cudaMalloc(&dids,mtok*4)); CU(cudaMalloc(&h,(size_t)mtok*H*4)); } else { dids=DS->dids; h=DS->hmain; }
@@ -483,8 +483,8 @@ int main(int argc,char**argv){
         if(prof){cudaEventRecord(b);}
         rmsnorm(DS->hl, h+(size_t)(mtok-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"),1,H,EPS,0);
         k_lmhead<<<VOCAB,256>>>(DS->dlog, DS->hl, m.dptr<const uint16_t*>(embn), H, VOCAB, SOFTCAP);
-        CU(cudaDeviceSynchronize());
-        lo.resize(VOCAB); CU(cudaMemcpy(lo.data(),DS->dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
+        if(ftok){ k_argmax<<<1,256>>>(DS->darg, DS->dlog, VOCAB); CU(cudaMemcpy(ftok,DS->darg,4,cudaMemcpyDeviceToHost)); }  // device argmax, copy 1 int (no 1MB host roundtrip)
+        else { CU(cudaDeviceSynchronize()); lo.resize(VOCAB); CU(cudaMemcpy(lo.data(),DS->dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost)); }
         if(prof){cudaEventRecord(c);cudaEventSynchronize(c);float ab,bc;cudaEventElapsedTime(&ab,a,b);cudaEventElapsedTime(&bc,b,c);t_layers+=ab;t_head+=bc;
             fprintf(stderr,"[prof] layers=%.1fms head=%.1fms (cum layers=%.0f head=%.0f)\n",ab,bc,t_layers,t_head);}
         if(allarg){ allarg->resize(mtok);  // batched: norm all positions -> one batched lm_head -> device argmax
@@ -516,8 +516,8 @@ int main(int argc,char**argv){
         for(int g=0; g<NGEN; ++g){
             printf("%d ",tok); fflush(stdout); ngen++;
             if(tok==1||tok==106) break;
-            run(std::vector<int>{tok}, S->valid_len, logits);
-            S->valid_len += 1; tok = argmax(logits);
+            int nexttok; run(std::vector<int>{tok}, S->valid_len, logits, nullptr, nullptr, &nexttok);
+            S->valid_len += 1; tok = nexttok;
         }
         cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
         printf("\n[base decode %d tok in %.1f ms = %.2f tok/s]\n", ngen, ms, ngen*1000.0/ms);

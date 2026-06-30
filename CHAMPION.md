@@ -5,10 +5,10 @@ that DFlash builds on; secondary metrics tracked too.
 
 | field | value |
 |---|---|
-| **BASE decode** | **29.89 tok/s** |
+| **BASE decode** | **30.73 tok/s** |
 | DFlash (predictable, DK=14) | 30.58 tok/s, accept 11.14/14 |
 | correctness | gate_self.sh PASS (primes + Paris/Blue/4/Au) |
-| commit | (baseline — pre-loop HEAD) |
+| commit | cycle1 device-argmax |
 | date | 2026-06-30 |
 | context depth | prompt ~25 tok, decode 60 |
 | memory | 16.4 GB weights |
