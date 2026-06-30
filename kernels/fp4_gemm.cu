@@ -36,7 +36,7 @@ void nvfp4_swizzle_scales(const uint8_t* logical, uint8_t* swizzled, int outer, 
 // ---- FP4-weight GEMV for single-token decode (W4A16: FP4 weight x fp32 activation) ----
 // y[N] = sum_k (fp4(wp[n,k]) * e4m3(ws[n,k/16]) / w_gscale) * x[k].  Raw (unswizzled) weight+scales.
 __device__ __forceinline__ float e2m1_dec(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
-__device__ __forceinline__ float e4m3_dec(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):((1.f+man*0.125f)*exp2f((float)(e-7))); return s?-v:v; }
+__device__ __forceinline__ float e4m3_dec(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
 __global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, float wg_inv,
                                 const float* x, int N, int K){
     int n=blockIdx.x; if(n>=N) return;

@@ -106,7 +106,7 @@ __global__ void k_argmax(int* out,const float* lg,int V){
 
 // ---- device-MoE kernels (no host round-trip; indexes expert weights by device top-8 ids) ----
 __device__ __forceinline__ float e2m1d(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
-__device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):((1.f+man*0.125f)*exp2f((float)(e-7))); return s?-v:v; }
+__device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
 // router scores[mtok,NE] = (rmsnorm_noscale(resid)*router_scale*H^-0.5) @ router_proj^T
 __global__ void k_router_scores(float* scores,const float* resid,const uint16_t* rproj,const uint16_t* rscale,int mtok,int H,int NE){
     int t=blockIdx.x; const float* x=resid+(size_t)t*H;
@@ -246,7 +246,9 @@ struct Session {
 static void linear(Model& m, float* out_row, const float* in_row, const std::string& prefix, int M, int N, int K){
     uint8_t* Wp = m.dptr<uint8_t*>(prefix+".weight_packed");
     uint8_t* Ws = m.dptr<uint8_t*>(prefix+".weight_scale");
-    w4a16_gemm(out_row, Wp, Ws, m.scalarF32(prefix+".weight_global_scale"), in_row, M, N, K, 0);
+    float wg = m.scalarF32(prefix+".weight_global_scale");
+    if(M==1) fp4_gemv(out_row, Wp, Ws, wg, in_row, N, K, 0);   // streaming GEMV (1KB shared -> high occupancy)
+    else     w4a16_gemm(out_row, Wp, Ws, wg, in_row, M, N, K, 0);  // batched (shared-dequant, weight reused over M)
 }
 
 // build rope cos/sin tables [seq, half] on host -> device
