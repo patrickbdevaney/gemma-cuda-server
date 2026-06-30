@@ -9,6 +9,7 @@
 #include "draft.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -113,6 +114,7 @@ __global__ void k_argmax(int* out,const float* lg,int V){
 
 // ---- device-MoE kernels (no host round-trip; indexes expert weights by device top-8 ids) ----
 __device__ __forceinline__ float e2m1d(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
+__device__ __forceinline__ __half2 dec_fp4x2(unsigned char b){ __half2_raw r=__nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)b,__NV_E2M1); return *reinterpret_cast<__half2*>(&r); }
 __device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
 __constant__ float C_LUT[256];   // e4m3 byte -> value, computed once (no per-block recompute)
 static void init_clut(){ float h[256]; for(int i=0;i<256;++i){ int s=(i>>7)&1,e=(i>>3)&0xF,man=i&7;
@@ -146,34 +148,42 @@ __global__ void k_router_top8(int* ids,float* ws,const float* scores,const uint1
     for(int j=0;j<K;++j){ ids[(size_t)t*K+j]=sel[j]; ws[(size_t)t*K+j]=(selp[j]/sumw)*bf2f(pes[sel[j]]); }
 }
 // expert gate/up: hbuf[t,j,i] = gelu(Wg_e[i]·x2[t]) * (Wu_e[i]·x2[t]); one block per (t,j,i)
-__global__ void k_moe_gateup(float* hbuf,const float* x2,const int* ids,
+__global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
     const uint8_t* const* gp,const uint8_t* const* gs,const float* gg,
     const uint8_t* const* up,const uint8_t* const* us,const float* ug,int mtok,int H,int MI){
     long idx=blockIdx.x; int i=idx%MI; long rest=idx/MI; int j=rest%8,t=rest/8; int e=ids[(size_t)t*8+j];
-    const float* x=x2+(size_t)t*H;
+    const __half* x=x2+(size_t)t*H;
     const unsigned* gpw=(const unsigned*)(gp[e]+(size_t)i*(H/2)); const uint8_t* gsw=gs[e]+(size_t)i*(H/16); float ginv=1.f/gg[e];
     const unsigned* upw=(const unsigned*)(up[e]+(size_t)i*(H/2)); const uint8_t* usw=us[e]+(size_t)i*(H/16); float uinv=1.f/ug[e];
     __shared__ float rg[256],ru[256]; float ag=0,au=0; int nu=H/8;
-    for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; const float* xv=x+k;
+    for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8;
+        uint4 xpk=*(const uint4*)(x+k); const __half2* xh2=(const __half2*)&xpk;  // 8 fp16 acts (4 half2)
         unsigned wg=gpw[vi]; float sg=C_LUT[gsw[k>>4]]*ginv; unsigned wu=upw[vi]; float su=C_LUT[usw[k>>4]]*uinv;
+        const unsigned char* wgb=(const unsigned char*)&wg; const unsigned char* wub=(const unsigned char*)&wu;
+        __half2 g2=__float2half2_rn(0.f),u2=__float2half2_rn(0.f);
         #pragma unroll
-        for(int q=0;q<8;++q){ float xq=xv[q]; ag+=e2m1d((uint8_t)((wg>>(q*4))&0xF))*sg*xq; au+=e2m1d((uint8_t)((wu>>(q*4))&0xF))*su*xq; } }
+        for(int b=0;b<4;++b){ g2=__hfma2(dec_fp4x2(wgb[b]),xh2[b],g2); u2=__hfma2(dec_fp4x2(wub[b]),xh2[b],u2); }
+        ag += sg*(__half2float(__low2half(g2))+__half2float(__high2half(g2)));
+        au += su*(__half2float(__low2half(u2))+__half2float(__high2half(u2))); }
     rg[threadIdx.x]=ag; ru[threadIdx.x]=au; __syncthreads();
     for(int s=128;s>0;s>>=1){ if(threadIdx.x<s){rg[threadIdx.x]+=rg[threadIdx.x+s];ru[threadIdx.x]+=ru[threadIdx.x+s];} __syncthreads(); }
-    if(threadIdx.x==0){ float g=rg[0]; float gel=0.5f*g*(1.f+tanhf(0.7978845608f*(g+0.044715f*g*g*g))); hbuf[idx]=gel*ru[0]; }
+    if(threadIdx.x==0){ float g=rg[0]; float gel=0.5f*g*(1.f+tanhf(0.7978845608f*(g+0.044715f*g*g*g))); hbuf[idx]=__float2half(gel*ru[0]); }
 }
 // expert down: out[t,d] += ws[t,j]*(Wd_e[d]·hbuf[t,j]); warp per (t,j,d), atomicAdd (parallel over experts).
 // out must be pre-zeroed. mtok*8*H warp-outputs.
-__global__ void k_moe_down(float* out,const float* hbuf,const int* ids,const float* ws,
+__global__ void k_moe_down(float* out,const __half* hbuf,const int* ids,const float* ws,
     const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int mtok,int H,int MI){
     long idx=blockIdx.x; int d=idx%H,t=idx/H;
     __shared__ float red[256]; float acc=0; int nu=MI/8;
     for(int j=0;j<8;++j){ int e=ids[(size_t)t*8+j]; float w=ws[(size_t)t*8+j];
         const unsigned* dpw=(const unsigned*)(dp[e]+(size_t)d*(MI/2)); const uint8_t* dsw=ds[e]+(size_t)d*(MI/16); float dinv=1.f/dg[e];
-        const float* hh=hbuf+((size_t)t*8+j)*MI; float s=0;
-        for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; unsigned wd=dpw[vi]; float sc=C_LUT[dsw[k>>4]]*dinv; const float* hv=hh+k;
+        const __half* hh=hbuf+((size_t)t*8+j)*MI; float s=0;
+        for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; unsigned wd=dpw[vi]; float sc=C_LUT[dsw[k>>4]]*dinv;
+            uint4 hpk=*(const uint4*)(hh+k); const __half2* hh2=(const __half2*)&hpk; const unsigned char* wdb=(const unsigned char*)&wd;
+            __half2 s2=__float2half2_rn(0.f);
             #pragma unroll
-            for(int q=0;q<8;++q) s+=e2m1d((uint8_t)((wd>>(q*4))&0xF))*sc*hv[q]; }
+            for(int b=0;b<4;++b) s2=__hfma2(dec_fp4x2(wdb[b]),hh2[b],s2);
+            s += sc*(__half2float(__low2half(s2))+__half2float(__high2half(s2))); }
         red[threadIdx.x]=s; __syncthreads();
         for(int sf=128;sf>0;sf>>=1){ if(threadIdx.x<sf)red[threadIdx.x]+=red[threadIdx.x+sf]; __syncthreads(); }
         if(threadIdx.x==0) acc+=w*red[0]; __syncthreads(); }
@@ -255,14 +265,15 @@ static Scratch* SC;
 static const int MAXM=16, QDMAX=16*512, KDMAX=16*512;
 struct DScratch {
     float *hmain,*hn,*q,*k,*v,*ao,*op,*dc,*ds;
-    float *resid,*mi,*g,*u,*hs1,*x2,*hbuf,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
-    float *hl,*dlog,*hln,*lg2; int* darg; __half* xh16;
+    float *resid,*mi,*g,*u,*hs1,*x2,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
+    float *hl,*dlog,*hln,*lg2; int* darg; __half *xh16,*hbuf,*x2_16;
     DScratch(){ auto A=[&](float*&p,size_t n){ CU(cudaMalloc(&p,n*4)); };
         CU(cudaMalloc(&xh16,(size_t)QDMAX*sizeof(__half)));  // fp16 activation scratch for GEMV (K up to 8192)
+        CU(cudaMalloc(&hbuf,(size_t)MAXM*8*MOE_INT*sizeof(__half))); CU(cudaMalloc(&x2_16,(size_t)MAXM*H*sizeof(__half)));
         A(hl,H);A(dlog,VOCAB);A(hln,MAXM*H);A(lg2,(size_t)MAXM*VOCAB);CU(cudaMalloc(&darg,MAXM*4));
         A(hmain,MAXM*H);A(hn,MAXM*H);A(q,MAXM*QDMAX);A(k,MAXM*KDMAX);A(v,MAXM*KDMAX);A(ao,MAXM*QDMAX);A(op,MAXM*H);
         A(dc,MAXM*256);A(ds,MAXM*256);A(resid,MAXM*H);A(mi,MAXM*H);A(g,MAXM*MLP_INT);A(u,MAXM*MLP_INT);A(hs1,MAXM*H);
-        A(x2,MAXM*H);A(hbuf,(size_t)MAXM*8*MOE_INT);A(moe_out,MAXM*H);A(scores,MAXM*128);A(top8_w,MAXM*8);A(sc1,MAXM);
+        A(x2,MAXM*H);A(moe_out,MAXM*H);A(scores,MAXM*128);A(top8_w,MAXM*8);A(sc1,MAXM);
         CU(cudaMalloc(&top8_ids,MAXM*8*4)); CU(cudaMalloc(&dids,MAXM*4)); }
 };
 static DScratch* DS;
@@ -360,9 +371,11 @@ static void moe(Model& m, float* h, int seq, int L){
     bool big=seq>MAXM; std::vector<float*> tf;
     auto pick=[&](float* d,size_t n)->float*{ if(!big)return d; float* p; CU(cudaMalloc(&p,n*4)); tf.push_back(p); return p; };
     float *resid=pick(DS->resid,seq*H),*mi=pick(DS->mi,seq*H),*g=pick(DS->g,seq*MLP_INT),*u=pick(DS->u,seq*MLP_INT),
-          *hs1=pick(DS->hs1,seq*H),*x2=pick(DS->x2,seq*H),*hbuf=pick(DS->hbuf,(size_t)seq*8*MOE_INT),*moe_out=pick(DS->moe_out,seq*H),
+          *hs1=pick(DS->hs1,seq*H),*x2=pick(DS->x2,seq*H),*moe_out=pick(DS->moe_out,seq*H),
           *scores=pick(DS->scores,seq*128),*top8_w=pick(DS->top8_w,seq*8);
-    int* top8_ids; if(big){CU(cudaMalloc(&top8_ids,seq*8*4));} else top8_ids=DS->top8_ids;
+    int* top8_ids; __half *hbuf,*x2_16;
+    if(big){CU(cudaMalloc(&top8_ids,seq*8*4)); CU(cudaMalloc(&hbuf,(size_t)seq*8*MOE_INT*sizeof(__half))); CU(cudaMalloc(&x2_16,(size_t)seq*H*sizeof(__half)));}
+    else { top8_ids=DS->top8_ids; hbuf=DS->hbuf; x2_16=DS->x2_16; }
     CU(cudaMemcpyAsync(resid,h,(size_t)seq*H*4,cudaMemcpyDeviceToDevice));
     rmsnorm(mi, resid, m.dptr<const uint16_t*>(P+"pre_feedforward_layernorm.weight"), seq, H, EPS, 0);
     linear(m,g,mi,P+"mlp.gate_proj",seq,MLP_INT,H); linear(m,u,mi,P+"mlp.up_proj",seq,MLP_INT,H);
@@ -373,8 +386,9 @@ static void moe(Model& m, float* h, int seq, int L){
     k_router_scores<<<(unsigned)((seq*NEXP+7)/8),256>>>(scores, mi, m.dptr<const uint16_t*>(P+"router.proj.weight"), seq, H, NEXP);
     k_router_top8<<<seq,1>>>(top8_ids, top8_w, scores, m.dptr<const uint16_t*>(P+"router.per_expert_scale"), NEXP, TOPK);
     rmsnorm(x2,resid,m.dptr<const uint16_t*>(P+"pre_feedforward_layernorm_2.weight"),seq,H,EPS,0);
+    k_f32_to_f16<<<(seq*H+255)/256,256>>>(x2_16, x2, seq*H);  // fp16 MoE activation for HW-decode gateup
     ExpertPtrs* ep=m.experts(L);
-    k_moe_gateup<<<(unsigned)(seq*TOPK*MOE_INT),256>>>(hbuf, x2, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
+    k_moe_gateup<<<(unsigned)(seq*TOPK*MOE_INT),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
     k_moe_down<<<(unsigned)(seq*H),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
     rmsnorm(moe_out,moe_out,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     add_inplace(hs1, moe_out, seq*H, 0);
@@ -382,7 +396,7 @@ static void moe(Model& m, float* h, int seq, int L){
     add_inplace(resid, hs1, seq*H, 0);
     CU(cudaMemcpyAsync(h, resid, (size_t)seq*H*4, cudaMemcpyDeviceToDevice));
     k_scale_const<<<(seq*H+255)/256,256>>>(h, m.scalarBf16(P+"layer_scalar"), seq*H);  // no sync (stream-0 ordered)
-    if(big){ CU(cudaDeviceSynchronize()); for(auto p:tf)cudaFree(p); cudaFree(top8_ids); }
+    if(big){ CU(cudaDeviceSynchronize()); for(auto p:tf)cudaFree(p); cudaFree(top8_ids); cudaFree(hbuf); cudaFree(x2_16); }
 }
 
 static bool DUMP=false;
