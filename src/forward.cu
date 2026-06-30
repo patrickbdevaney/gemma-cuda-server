@@ -140,12 +140,25 @@ __global__ void k_router_scores(float* scores,const float* hn,const uint16_t* rp
     if(lane==0) scores[(size_t)t*NE+e]=acc;
 }
 // softmax over NE -> top-K (by score) -> renorm to sum 1 -> *per_expert_scale. one thread/token.
+// 128 threads (one per expert): parallel max/softmax + K rounds of reduction-argmax (was 1 thread, 1024 ops).
 __global__ void k_router_top8(int* ids,float* ws,const float* scores,const uint16_t* pes,int NE,int K){
-    int t=blockIdx.x; if(threadIdx.x) return; const float* sc=scores+(size_t)t*NE;
-    float mx=-1e30f; for(int e=0;e<NE;++e) mx=fmaxf(mx,sc[e]); float Z=0; for(int e=0;e<NE;++e) Z+=__expf(sc[e]-mx);
-    bool used[128]; for(int e=0;e<NE;++e) used[e]=false; float sumw=0; int sel[16]; float selp[16];
-    for(int j=0;j<K;++j){ float best=-1e30f; int bi=0; for(int e=0;e<NE;++e) if(!used[e]&&sc[e]>best){best=sc[e];bi=e;} used[bi]=true; sel[j]=bi; selp[j]=__expf(sc[bi]-mx)/Z; sumw+=selp[j]; }
-    for(int j=0;j<K;++j){ ids[(size_t)t*K+j]=sel[j]; ws[(size_t)t*K+j]=(selp[j]/sumw)*bf2f(pes[sel[j]]); }
+    int t=blockIdx.x, e=threadIdx.x; const float* sc=scores+(size_t)t*NE;
+    __shared__ float rv[128]; __shared__ int ri[128]; __shared__ bool used[128];
+    __shared__ float mx,Z; __shared__ int sel[16]; __shared__ float selp[16];
+    float my=(e<NE)?sc[e]:-1e30f; used[e]=(e>=NE);
+    rv[e]=my; __syncthreads();
+    for(int s=64;s>0;s>>=1){ if(e<s)rv[e]=fmaxf(rv[e],rv[e+s]); __syncthreads(); }
+    if(e==0)mx=rv[0]; __syncthreads();
+    float ex=(e<NE)?__expf(my-mx):0.f; rv[e]=ex; __syncthreads();
+    for(int s=64;s>0;s>>=1){ if(e<s)rv[e]+=rv[e+s]; __syncthreads(); }
+    if(e==0)Z=rv[0]; __syncthreads();
+    for(int j=0;j<K;++j){
+        rv[e]=used[e]?-1e30f:my; ri[e]=e; __syncthreads();
+        for(int s=64;s>0;s>>=1){ if(e<s && rv[e+s]>rv[e]){rv[e]=rv[e+s];ri[e]=ri[e+s];} __syncthreads(); }
+        if(e==0){ int bi=ri[0]; used[bi]=true; sel[j]=bi; selp[j]=__expf(sc[bi]-mx)/Z; } __syncthreads();
+    }
+    if(e==0){ float sumw=0; for(int j=0;j<K;++j)sumw+=selp[j];
+        for(int j=0;j<K;++j){ ids[(size_t)t*K+j]=sel[j]; ws[(size_t)t*K+j]=(selp[j]/sumw)*bf2f(pes[sel[j]]); } }
 }
 // expert gate/up: hbuf[t,j,i] = gelu(Wg_e[i]·x2[t]) * (Wu_e[i]·x2[t]); one block per (t,j,i)
 __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
@@ -390,7 +403,7 @@ static void moe(Model& m, float* h, int seq, int L){
     rmsnorm(hs1,hs1,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_1.weight"),seq,H,EPS,0);
     k_router_hn<<<seq,256>>>(mi, resid, m.dptr<const uint16_t*>(P+"router.scale"), seq, H);  // reuse mi as hn buffer
     k_router_scores<<<(unsigned)((seq*NEXP+7)/8),256>>>(scores, mi, m.dptr<const uint16_t*>(P+"router.proj.weight"), seq, H, NEXP);
-    k_router_top8<<<seq,1>>>(top8_ids, top8_w, scores, m.dptr<const uint16_t*>(P+"router.per_expert_scale"), NEXP, TOPK);
+    k_router_top8<<<seq,128>>>(top8_ids, top8_w, scores, m.dptr<const uint16_t*>(P+"router.per_expert_scale"), NEXP, TOPK);
     rmsnorm(x2,resid,m.dptr<const uint16_t*>(P+"pre_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     k_f32_to_f16<<<(seq*H+255)/256,256>>>(x2_16, x2, seq*H);  // fp16 MoE activation for HW-decode gateup
     ExpertPtrs* ep=m.experts(L);
