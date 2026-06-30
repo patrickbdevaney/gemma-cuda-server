@@ -84,10 +84,14 @@ __global__ void w4a16_gemm_kernel(float* out, const uint8_t* wp, const uint8_t* 
     const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); const uint8_t* wsn=ws+(size_t)n*(K/16);
     float acc[16]; for(int m=0;m<M;++m) acc[m]=0.f;
     int nu=K/8;
-    for(int vi=lane; vi<nu; vi+=32){ unsigned w=wpn[vi]; int k=vi*8; float sc=lut[wsn[k>>4]];
+    for(int vi=lane; vi<nu; vi+=32){ unsigned w=__ldcs(&wpn[vi]); int k=vi*8; float sc=lut[__ldcs(&wsn[k>>4])];
+        const unsigned char* wb=(const unsigned char*)&w; float wv[8];   // HW FP4 decode (4 calls vs 8 table lookups)
         #pragma unroll
-        for(int q=0;q<8;++q){ float wv=e2m1_dec((uint8_t)((w>>(q*4))&0xF))*sc;
-            for(int m=0;m<M;++m) acc[m]+=wv*x[(size_t)m*K+k+q]; } }
+        for(int b=0;b<4;++b){ __half2_raw r=__nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)wb[b],__NV_E2M1);
+            __half2 h=*reinterpret_cast<__half2*>(&r); wv[2*b]=__low2float(h)*sc; wv[2*b+1]=__high2float(h)*sc; }
+        #pragma unroll
+        for(int q=0;q<8;++q){ float wvq=wv[q];
+            for(int m=0;m<M;++m) acc[m]+=wvq*x[(size_t)m*K+k+q]; } }
     for(int m=0;m<M;++m){
         #pragma unroll
         for(int o=16;o>0;o>>=1) acc[m]+=__shfl_down_sync(0xffffffffu,acc[m],o);
