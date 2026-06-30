@@ -21,7 +21,7 @@ See directive in project root convo; verified arch in `reference/ARCHITECTURE.md
 - [ ] **Phase 3.2** attention (global hd512/2kv/pRoPE-0.25/θ1e6 vs sliding hd256/8kv/θ1e4/win1024)
 - [x] **Phase 3.3** MoE (router softmax-top8-renorm + dense MLP || 128 experts) — in src/forward.cu
 - [x] **Phase 3.4 ✅** full forward GATE PASSES: top-1 matches vLLM on confident prompts (Paris/Blue/4, logprobs match). gibberish prompts not a valid gate (norm 588x amplifies quant noise). scripts/gate_forward.sh
-- [ ] **Phase 3.5** single-session 64K FP8 KV buffer + prefix retention
+- [x] **Step B (3.5)** single-session BF16 KV cache + incremental decode — LOSSLESS (KV-cached gen == full recompute: 'Red, yellow, and blue.'), prefill top-1 still Paris. Decode 6.54 tok/s (was sec/tok). sdpa_cache_kernel + Session. CAP via CTX env. BF16-KV budget ~14GB@64K. TODO: M=1 GEMV (avoid 128-pad), batched MoE, fewer host round-trips.
 - [ ] **Phase 3.6** DFlash draft+verify (block_size 16, taps [1,6,11,17,22,27])
 - [ ] **Phase 3.7** fused decode-step CUDA graph
 - [ ] **Phase 3.8** OpenAI-compatible server loop

@@ -44,6 +44,36 @@ __global__ void k_lmhead(float* logits,const float* hlast,const uint16_t* emb,in
     for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
     if(threadIdx.x==0){ float x=red[0]; logits[v]=cap*tanhf(x/cap); } }
 
+// ---- KV-cache decode kernels ----
+// store projected K/V (fp32 [m,nkv,hd]) into BF16 cache at positions [base, base+m)
+__global__ void k_store_kv(uint16_t* cache, const float* src, int base, int m, int nkv, int hd){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; int n=m*nkv*hd; if(i>=n)return;
+    int t=i/(nkv*hd), rest=i%(nkv*hd);
+    float v=src[i]; unsigned u; memcpy(&u,&v,4); cache[(size_t)(base+t)*nkv*hd + rest]=(uint16_t)(u>>16);
+}
+// single-query-block attention over a BF16 KV cache. query i (abs pos base+i) attends keys [lo, base+i].
+// out[m,nh,hd], Q[m,nh,hd] fp32; Kc/Vc[CAP,nkv,hd] bf16. window=0 => full causal.
+__global__ void sdpa_cache_kernel(float* out, const float* Q, const uint16_t* Kc, const uint16_t* Vc,
+                                  int m, int base, int nkv, int nh, int hd, int window, float scaling){
+    int i=blockIdx.x, h=blockIdx.y; if(i>=m||h>=nh) return;
+    int p=base+i, kvh=h/(nh/nkv); int lo=(window>0)?max(0,p-window+1):0;
+    extern __shared__ float sh[]; float* Qs=sh; float* acc=sh+hd; float* red=sh+2*hd;
+    int d=threadIdx.x;
+    Qs[d]=Q[((size_t)i*nh+h)*hd+d]; acc[d]=0.f; __syncthreads();
+    float m_run=-1e30f, l_run=0.f;
+    for(int j=lo;j<=p;++j){
+        unsigned uk=(unsigned)Kc[((size_t)j*nkv+kvh)*hd+d]<<16; float kf; memcpy(&kf,&uk,4);
+        red[d]=Qs[d]*kf; __syncthreads();
+        for(int s=hd/2;s>0;s>>=1){ if(d<s)red[d]+=red[d+s]; __syncthreads(); }
+        float score=red[0]*scaling;
+        float nm=fmaxf(m_run,score), corr=__expf(m_run-nm), pj=__expf(score-nm);
+        l_run=l_run*corr+pj;
+        unsigned uv=(unsigned)Vc[((size_t)j*nkv+kvh)*hd+d]<<16; float vf; memcpy(&vf,&uv,4);
+        acc[d]=acc[d]*corr+pj*vf; m_run=nm; __syncthreads();
+    }
+    out[((size_t)i*nh+h)*hd+d]=acc[d]/l_run;
+}
+
 // ---- Model ----
 struct Model {
     st::SafeTensors* st; uint8_t* draw; const uint8_t* h0;
@@ -95,6 +125,14 @@ struct Scratch { float* in_pad; uint8_t* xp; uint8_t* xs; float* dcol; size_t ca
         CU(cudaMalloc(&xs, nvfp4_scale_buffer_bytes(cap_rows,cap_k))); CU(cudaMalloc(&dcol, cap_rows*cap_n*4)); } };
 static Scratch* SC;
 
+// ---- single-session KV cache (BF16), fixed capacity ----
+static int CAP = 8192;   // context capacity (set via CTX env); 65536 for full 64K target
+struct Session {
+    uint16_t* Kc[NLAYER]; uint16_t* Vc[NLAYER]; int valid_len=0;
+    Session(){ for(int L=0;L<NLAYER;++L){ int nkv=is_full(L)?NKV_F:NKV_S, hd=is_full(L)?HD_F:HD_S;
+        size_t sz=(size_t)CAP*nkv*hd*2; CU(cudaMalloc(&Kc[L],sz)); CU(cudaMalloc(&Vc[L],sz)); } }
+};
+
 // W4A4 Linear: out_row[M,N] = (in_row[M,K] @ W[N,K]^T) using stored global scales. Pads M>=128.
 static void linear(Model& m, float* out_row, const float* in_row, const std::string& prefix, int M, int N, int K){
     int Mp = M<128?128:M;
@@ -113,47 +151,50 @@ static void linear(Model& m, float* out_row, const float* in_row, const std::str
 }
 
 // build rope cos/sin tables [seq, half] on host -> device
-static void rope_tables(int seq,int head_dim,double theta,int rope_angles,float** dcos,float** dsin){
+static void rope_tables(int seq,int head_dim,double theta,int rope_angles,float** dcos,float** dsin,int base=0){
     int half=head_dim/2; std::vector<float> c((size_t)seq*half), s((size_t)seq*half);
-    for(int p=0;p<seq;++p) for(int j=0;j<half;++j){
+    for(int pp=0;pp<seq;++pp){ int p=base+pp; for(int j=0;j<half;++j){
         double inv = (j<rope_angles)? 1.0/pow(theta, (2.0*j)/head_dim) : 0.0;
-        double a=p*inv; c[(size_t)p*half+j]=cosf(a); s[(size_t)p*half+j]=sinf(a);
-    }
+        double a=p*inv; c[(size_t)pp*half+j]=cosf(a); s[(size_t)pp*half+j]=sinf(a);
+    }}
     CU(cudaMalloc(dcos,c.size()*4)); CU(cudaMalloc(dsin,s.size()*4));
     CU(cudaMemcpy(*dcos,c.data(),c.size()*4,cudaMemcpyHostToDevice));
     CU(cudaMemcpy(*dsin,s.data(),s.size()*4,cudaMemcpyHostToDevice));
 }
 
-// ---- attention block: h_io[seq,H] updated in place (residual handled by caller? no, here) ----
-static void attention(Model& m, float* h, int seq, int L){
+// ---- attention with KV cache: processes mtok new tokens at positions [base, base+mtok) ----
+static void attention_cached(Model& m, Session& S, float* h, int mtok, int base, int L){
     std::string P="model.language_model.layers."+std::to_string(L)+".";
     int hd = is_full(L)?HD_F:HD_S, nkv = is_full(L)?NKV_F:NKV_S;
     int qd=NHEAD*hd, kd=nkv*hd;
     float *hn,*q,*k,*v,*ao;
-    CU(cudaMalloc(&hn,(size_t)seq*H*4)); CU(cudaMalloc(&q,(size_t)seq*qd*4));
-    CU(cudaMalloc(&k,(size_t)seq*kd*4)); CU(cudaMalloc(&v,(size_t)seq*kd*4)); CU(cudaMalloc(&ao,(size_t)seq*qd*4));
-    rmsnorm(hn, h, m.dptr<const uint16_t*>(P+"input_layernorm.weight"), seq, H, EPS, 0);
-    linear(m, q, hn, P+"self_attn.q_proj", seq, qd, H);
-    linear(m, k, hn, P+"self_attn.k_proj", seq, kd, H);
-    if(is_full(L)) CU(cudaMemcpy(v, k, (size_t)seq*kd*4, cudaMemcpyDeviceToDevice)); // k_eq_v: v = raw k_proj
-    else linear(m, v, hn, P+"self_attn.v_proj", seq, kd, H);
-    // per-head q/k norm (weight [hd]); v_norm no weight
-    rmsnorm(q, q, m.dptr<const uint16_t*>(P+"self_attn.q_norm.weight"), seq*NHEAD, hd, EPS, 0);
-    rmsnorm(k, k, m.dptr<const uint16_t*>(P+"self_attn.k_norm.weight"), seq*nkv, hd, EPS, 0);
-    rmsnorm(v, v, (const uint16_t*)nullptr, seq*nkv, hd, EPS, 0); // v_norm with_scale=false
-    // rope
+    CU(cudaMalloc(&hn,(size_t)mtok*H*4)); CU(cudaMalloc(&q,(size_t)mtok*qd*4));
+    CU(cudaMalloc(&k,(size_t)mtok*kd*4)); CU(cudaMalloc(&v,(size_t)mtok*kd*4)); CU(cudaMalloc(&ao,(size_t)mtok*qd*4));
+    rmsnorm(hn, h, m.dptr<const uint16_t*>(P+"input_layernorm.weight"), mtok, H, EPS, 0);
+    linear(m, q, hn, P+"self_attn.q_proj", mtok, qd, H);
+    linear(m, k, hn, P+"self_attn.k_proj", mtok, kd, H);
+    if(is_full(L)) CU(cudaMemcpy(v, k, (size_t)mtok*kd*4, cudaMemcpyDeviceToDevice)); // k_eq_v
+    else linear(m, v, hn, P+"self_attn.v_proj", mtok, kd, H);
+    rmsnorm(q, q, m.dptr<const uint16_t*>(P+"self_attn.q_norm.weight"), mtok*NHEAD, hd, EPS, 0);
+    rmsnorm(k, k, m.dptr<const uint16_t*>(P+"self_attn.k_norm.weight"), mtok*nkv, hd, EPS, 0);
+    rmsnorm(v, v, (const uint16_t*)nullptr, mtok*nkv, hd, EPS, 0); // v_norm no scale
     float *dc,*ds; double theta=is_full(L)?1e6:1e4; int rang=is_full(L)?64:128;
-    rope_tables(seq, hd, theta, rang, &dc, &ds);
-    rope_rotate_half(q, dc, ds, seq, NHEAD, hd, hd, 0);
-    rope_rotate_half(k, dc, ds, seq, nkv,   hd, hd, 0);
-    // sdpa
-    sdpa(ao, q, k, v, seq, NHEAD, nkv, hd, is_full(L)?0:SWIN, 1.0f, 0);
+    rope_tables(mtok, hd, theta, rang, &dc, &ds, base);
+    rope_rotate_half(q, dc, ds, mtok, NHEAD, hd, hd, 0);
+    rope_rotate_half(k, dc, ds, mtok, nkv,   hd, hd, 0);
     CU(cudaDeviceSynchronize());
-    // o_proj -> tmp, post_attention_layernorm, residual add
-    float* op; CU(cudaMalloc(&op,(size_t)seq*H*4));
-    linear(m, op, ao, P+"self_attn.o_proj", seq, H, qd);
-    rmsnorm(op, op, m.dptr<const uint16_t*>(P+"post_attention_layernorm.weight"), seq, H, EPS, 0);
-    add_inplace(h, op, seq*H, 0);     // h = residual + post_attn(attn)
+    // append K,V (post-norm,post-rope) to cache, then attend new q over cache[0..base+i]
+    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Kc[L], k, base, mtok, nkv, hd);
+    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Vc[L], v, base, mtok, nkv, hd);
+    CU(cudaDeviceSynchronize());
+    int shmem=(2*hd+ (hd>256?hd:256))*4;
+    dim3 grid(mtok,NHEAD);
+    sdpa_cache_kernel<<<grid,hd,shmem>>>(ao, q, S.Kc[L], S.Vc[L], mtok, base, nkv, NHEAD, hd, is_full(L)?0:SWIN, 1.0f);
+    CU(cudaDeviceSynchronize());
+    float* op; CU(cudaMalloc(&op,(size_t)mtok*H*4));
+    linear(m, op, ao, P+"self_attn.o_proj", mtok, H, qd);
+    rmsnorm(op, op, m.dptr<const uint16_t*>(P+"post_attention_layernorm.weight"), mtok, H, EPS, 0);
+    add_inplace(h, op, mtok*H, 0);
     CU(cudaDeviceSynchronize());
     cudaFree(hn);cudaFree(q);cudaFree(k);cudaFree(v);cudaFree(ao);cudaFree(op);cudaFree(dc);cudaFree(ds);
 }
@@ -237,38 +278,54 @@ int main(int argc,char**argv){
     if(getenv("DUMP")) DUMP=true; system("mkdir -p /tmp/cudahs");
     std::string ckpt = argc>1?argv[1]:std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-it-NVFP4/model.safetensors";
     std::string tokfile = argc>2?argv[2]:"/tmp/tokens.txt";
-    Model m(ckpt); SC=new Scratch();
+    if(getenv("CTX")) CAP=atoi(getenv("CTX"));
+    Model m(ckpt); SC=new Scratch(); Session* S=new Session();
     // read token ids
     std::vector<int> ids; { FILE* f=fopen(tokfile.c_str(),"r"); int t; while(fscanf(f,"%d",&t)==1)ids.push_back(t); fclose(f);}
-    int seq=ids.size(); printf("seq=%d tokens\n",seq);
-    int NGEN = getenv("GEN")? atoi(getenv("GEN")) : 0;   // 0 => just print top-5 of next token
-    std::vector<int> sq = ids;
+    int seq=ids.size(); printf("seq=%d tokens, CAP=%d\n",seq,CAP);
+    int NGEN = getenv("GEN")? atoi(getenv("GEN")) : 0;
     const char* embn="model.language_model.embed_tokens.weight";
-    for(int step=0; step<=NGEN; ++step){
-        seq = sq.size();
-        int* dids; CU(cudaMalloc(&dids,seq*4)); CU(cudaMemcpy(dids,sq.data(),seq*4,cudaMemcpyHostToDevice));
-        float* h; CU(cudaMalloc(&h,(size_t)seq*H*4));
-        k_embed<<<seq,256>>>(h, m.dptr<const uint16_t*>(embn), dids, seq, H, EMB_SCALE);
+    // run mtok tokens at positions [base, base+mtok); fill logits_out for the LAST token; updates KV cache
+    auto run=[&](const std::vector<int>& nids,int base,std::vector<float>& lo){
+        int mtok=nids.size();
+        int* dids; CU(cudaMalloc(&dids,mtok*4)); CU(cudaMemcpy(dids,nids.data(),mtok*4,cudaMemcpyHostToDevice));
+        float* h; CU(cudaMalloc(&h,(size_t)mtok*H*4));
+        k_embed<<<mtok,256>>>(h, m.dptr<const uint16_t*>(embn), dids, mtok, H, EMB_SCALE);
         CU(cudaDeviceSynchronize());
-        if(step==0) dump_h(h, seq, 0);
-        for(int L=0; L<NLAYER; ++L){ attention(m, h, seq, L); moe(m, h, seq, L); if(step==0)dump_h(h,seq,L+1); }
+        for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,mtok,base,L); moe(m,h,mtok,L); }
         float* hl; CU(cudaMalloc(&hl,H*4));
-        rmsnorm(hl, h+(size_t)(seq-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"), 1, H, EPS, 0);
+        rmsnorm(hl, h+(size_t)(mtok-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"),1,H,EPS,0);
         float* dlog; CU(cudaMalloc(&dlog,(size_t)VOCAB*4));
         k_lmhead<<<VOCAB,256>>>(dlog, hl, m.dptr<const uint16_t*>(embn), H, VOCAB, SOFTCAP);
         CU(cudaDeviceSynchronize());
-        std::vector<float> logits(VOCAB); CU(cudaMemcpy(logits.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
-        int best=0; for(int i=1;i<VOCAB;++i) if(logits[i]>logits[best]) best=i;
-        if(step<NGEN){ printf("%d ",best); fflush(stdout); sq.push_back(best); }
-        else {
-            double mx=-1e30; for(float v:logits)mx=std::max(mx,(double)v); double Z=0; for(float v:logits)Z+=exp((double)v-mx);
-            std::vector<int> ord(VOCAB); for(int i=0;i<VOCAB;++i)ord[i]=i;
-            std::partial_sort(ord.begin(),ord.begin()+5,ord.end(),[&](int a,int b){return logits[a]>logits[b];});
-            printf("\ntop-5 next-token  (id : logit : logprob):\n");
-            for(int j=0;j<5;++j){ int id=ord[j]; double lp=(double)logits[id]-mx-log(Z); printf("  %6d : %8.4f : %8.4f\n",id,logits[id],lp); }
-        }
+        lo.resize(VOCAB); CU(cudaMemcpy(lo.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
         cudaFree(dids);cudaFree(h);cudaFree(hl);cudaFree(dlog);
-        if(step<NGEN && (best==1||best==106)) break;   // EOS / end-of-turn
+    };
+    auto argmax=[&](const std::vector<float>& lg){ int b=0; for(int i=1;i<VOCAB;++i) if(lg[i]>lg[b])b=i; return b; };
+    std::vector<float> logits;
+    // prefill the prompt
+    cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    run(ids, 0, logits); S->valid_len = seq;
+    int tok = argmax(logits);
+    if(NGEN==0){
+        double mx=-1e30; for(float v:logits)mx=std::max(mx,(double)v); double Z=0; for(float v:logits)Z+=exp((double)v-mx);
+        std::vector<int> ord(VOCAB); for(int i=0;i<VOCAB;++i)ord[i]=i;
+        std::partial_sort(ord.begin(),ord.begin()+5,ord.end(),[&](int a,int b){return logits[a]>logits[b];});
+        printf("\ntop-5 next-token  (id : logit : logprob):\n");
+        for(int j=0;j<5;++j){ int id=ord[j]; double lp=(double)logits[id]-mx-log(Z); printf("  %6d : %8.4f : %8.4f\n",id,logits[id],lp); }
+        return 0;
     }
+    // decode loop (incremental, KV-cached)
+    cudaEventRecord(t0);
+    int ngen=0;
+    for(int g=0; g<NGEN; ++g){
+        printf("%d ",tok); fflush(stdout); ngen++;
+        if(tok==1||tok==106) break;
+        run(std::vector<int>{tok}, S->valid_len, logits);
+        S->valid_len += 1; tok = argmax(logits);
+    }
+    cudaEventRecord(t1); cudaEventSynchronize(t1);
+    float ms=0; cudaEventElapsedTime(&ms,t0,t1);
+    printf("\n[decode %d tokens in %.1f ms = %.2f tok/s]\n", ngen, ms, ngen*1000.0/ms);
     return 0;
 }
