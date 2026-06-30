@@ -115,6 +115,19 @@ __global__ void k_argmax(int* out,const float* lg,int V){
 // ---- device-MoE kernels (no host round-trip; indexes expert weights by device top-8 ids) ----
 __device__ __forceinline__ float e2m1d(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
 __device__ __forceinline__ __half2 dec_fp4x2(unsigned char b){ __half2_raw r=__nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)b,__NV_E2M1); return *reinterpret_cast<__half2*>(&r); }
+// W4A4 emulation: round-trip activations through FP4 (per-group-16 amax scale) to inject W4A4 precision into
+// the hidden states/taps without changing the GEMM. Tests if W4A16-vs-W4A4 taps explain low code acceptance.
+__global__ void k_fp4_roundtrip(float* x,long n){
+    long g=(long)blockIdx.x*blockDim.x+threadIdx.x; long base=g*16; if(base>=n) return;
+    float amax=0; for(int i=0;i<16;++i) amax=fmaxf(amax,fabsf(x[base+i]));
+    if(amax<1e-12f){ for(int i=0;i<16;++i)x[base+i]=0.f; return; }
+    float scale=amax/6.f, inv=1.f/scale;
+    for(int i=0;i<16;++i){ float v=x[base+i]; float a=fabsf(v)*inv; float s=v<0?-1.f:1.f; float q;
+        if(a<0.25f)q=0;else if(a<0.75f)q=.5f;else if(a<1.25f)q=1.f;else if(a<1.75f)q=1.5f;
+        else if(a<2.5f)q=2.f;else if(a<3.5f)q=3.f;else if(a<5.f)q=4.f;else q=6.f;
+        x[base+i]=s*q*scale; }
+}
+static bool W4A4_TAPS=false;
 __device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
 __constant__ float C_LUT[256];   // e4m3 byte -> value, computed once (no per-block recompute)
 static void init_clut(){ float h[256]; for(int i=0;i<256;++i){ int s=(i>>7)&1,e=(i>>3)&0xF,man=i&7;
@@ -289,9 +302,10 @@ static const int MAXM=16, QDMAX=16*512, KDMAX=16*512;
 struct DScratch {
     float *hmain,*hn,*q,*k,*v,*ao,*op,*dc,*ds;
     float *resid,*mi,*g,*u,*hs1,*x2,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
-    float *hl,*dlog,*hln,*lg2; int* darg; __half *xh16,*hbuf,*x2_16;
+    float *hl,*dlog,*hln,*lg2,*aq; int* darg; __half *xh16,*hbuf,*x2_16;
     DScratch(){ auto A=[&](float*&p,size_t n){ CU(cudaMalloc(&p,n*4)); };
         CU(cudaMalloc(&xh16,(size_t)MAXM*8192*sizeof(__half)));  // fp16 activation scratch: M=1 GEMV[K] or M<=16 GEMM[M,K]
+        CU(cudaMalloc(&aq,(size_t)MAXM*8192*4));  // W4A4-emulation activation round-trip scratch
         CU(cudaMalloc(&hbuf,(size_t)MAXM*8*MOE_INT*sizeof(__half))); CU(cudaMalloc(&x2_16,(size_t)MAXM*H*sizeof(__half)));
         A(hl,H);A(dlog,VOCAB);A(hln,MAXM*H);A(lg2,(size_t)MAXM*VOCAB);CU(cudaMalloc(&darg,MAXM*4));
         A(hmain,MAXM*H);A(hn,MAXM*H);A(q,MAXM*QDMAX);A(k,MAXM*KDMAX);A(v,MAXM*KDMAX);A(ao,MAXM*QDMAX);A(op,MAXM*H);
@@ -316,15 +330,23 @@ static void linear(Model& m, float* out_row, const float* in_row, const std::str
     uint8_t* Wp = m.dptr<uint8_t*>(prefix+".weight_packed");
     uint8_t* Ws = m.dptr<uint8_t*>(prefix+".weight_scale");
     float wg = m.scalarF32(prefix+".weight_global_scale");
-    if(M==1){ k_f32_to_f16<<<(K+255)/256,256>>>(DS->xh16, in_row, K);   // fp16 activation -> 128-bit loads in GEMV
+    const float* xin=in_row; float* aq_big=nullptr;
+    if(W4A4_TAPS){   // emulate W4A4: round-trip activation through FP4 before the (W4A16) GEMM
+        float* aq; bool biga=(size_t)M*K>(size_t)MAXM*8192;
+        if(biga){ CU(cudaMalloc(&aq,(size_t)M*K*4)); aq_big=aq; } else aq=DS->aq;
+        CU(cudaMemcpyAsync(aq,in_row,(size_t)M*K*4,cudaMemcpyDeviceToDevice));
+        k_fp4_roundtrip<<<(unsigned)(((long)M*K/16+255)/256),256>>>(aq,(long)M*K); xin=aq;
+    }
+    if(M==1){ k_f32_to_f16<<<(K+255)/256,256>>>(DS->xh16, xin, K);   // fp16 activation -> 128-bit loads in GEMV
         fp4_gemv(out_row, Wp, Ws, wg, DS->xh16, N, K, 0); }
     else {   // batched W4A16: HW-decode weight once, reuse across M tokens via half2 (fp16 acts)
         __half* x16; bool bigx = M>MAXM;
         if(bigx) CU(cudaMalloc(&x16,(size_t)M*K*sizeof(__half))); else x16=DS->xh16;
-        k_f32_to_f16<<<((size_t)M*K+255)/256,256>>>(x16, in_row, (size_t)M*K);
+        k_f32_to_f16<<<((size_t)M*K+255)/256,256>>>(x16, xin, (size_t)M*K);
         w4a16_gemm(out_row, Wp, Ws, wg, x16, M, N, K, 0);
         if(bigx){ CU(cudaStreamSynchronize(0)); CU(cudaFree(x16)); }
     }
+    if(aq_big){ CU(cudaStreamSynchronize(0)); CU(cudaFree(aq_big)); }
 }
 
 // build rope cos/sin tables [seq, half] on host -> device
@@ -415,6 +437,7 @@ static void moe(Model& m, float* h, int seq, int L){
     k_router_scores<<<(unsigned)((seq*NEXP+7)/8),256>>>(scores, mi, m.dptr<const uint16_t*>(P+"router.proj.weight"), seq, H, NEXP);
     k_router_top8<<<seq,128>>>(top8_ids, top8_w, scores, m.dptr<const uint16_t*>(P+"router.per_expert_scale"), NEXP, TOPK);
     rmsnorm(x2,resid,m.dptr<const uint16_t*>(P+"pre_feedforward_layernorm_2.weight"),seq,H,EPS,0);
+    if(W4A4_TAPS) k_fp4_roundtrip<<<(unsigned)(((long)seq*H/16+255)/256),256>>>(x2,(long)seq*H);  // W4A4 emul (MoE act)
     k_f32_to_f16<<<(seq*H+255)/256,256>>>(x2_16, x2, seq*H);  // fp16 MoE activation for HW-decode gateup
     ExpertPtrs* ep=m.experts(L);
     k_moe_gateup<<<(unsigned)((seq*TOPK*MOE_INT+7)/8),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
@@ -438,6 +461,7 @@ int main(int argc,char**argv){
     std::string ckpt = argc>1?argv[1]:std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-it-NVFP4/model.safetensors";
     std::string tokfile = argc>2?argv[2]:"/tmp/tokens.txt";
     if(getenv("CTX")) CAP=atoi(getenv("CTX"));
+    W4A4_TAPS=getenv("W4A4_TAPS")!=nullptr;
     Model m(ckpt); SC=new Scratch(); DS=new DScratch(); init_clut(); Session* S=new Session();
     // read token ids
     std::vector<int> ids; { FILE* f=fopen(tokfile.c_str(),"r"); int t; while(fscanf(f,"%d",&t)==1)ids.push_back(t); fclose(f);}
