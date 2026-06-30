@@ -24,3 +24,11 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
 - change: base decode was `k_lmhead -> cudaMemcpy 1MB logits D2H -> host argmax over 262144` every step;
   added `ftok` path = `k_argmax<<<1>>>` on device + copy 1 int. Skips 1MB D2H + serial host argmax.
 - correctness: PASS | base 29.89 -> **30.73 tok/s (+2.8%)** | **CHAMPION** | clean isolated win.
+
+### [2] CUDA graph capture of the base decode step
+- change: base/position -> `__device__ g_base` (read by k_rope_tables/k_store_kv/sdpa_cache); token via DS->dids;
+  decode_step self-advances on-device (k_advance: dids=argmax, g_base++). Warmup 1 eager step (lazy init) then
+  cudaStreamBeginCapture(perThread) decode_step -> instantiate -> replay (1 graph launch replaces ~1000 kernel
+  launches/step). Build needs `--default-stream per-thread` (scripts/build.sh). NOGRAPH=1 = eager fallback.
+- correctness: PASS | base 30.73 -> **34.18 tok/s (+11.2%)** | **CHAMPION** | launch-overhead was ~24% of step;
+  CUDA_LAUNCH_BLOCKING probe (30.4->17.8) confirmed launch-sensitivity. DFlash unaffected (eager).

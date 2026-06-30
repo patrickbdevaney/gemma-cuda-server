@@ -27,6 +27,7 @@ static const int VOCAB=262144, NEXP=128, TOPK=8, MOE_INT=704, MLP_INT=2112, SWIN
 static const float EPS=1e-6f, SOFTCAP=30.0f;
 static const float EMB_SCALE=53.06599664f;             // sqrt(2816)
 static inline bool is_full(int L){ return L==5||L==11||L==17||L==23||L==29; }
+__device__ int g_base=0;  // decode position read by base-dependent kernels (enables CUDA-graph replay)
 
 // ---- helper kernels ----
 __device__ __forceinline__ float bf2f(uint16_t h){ unsigned u=(unsigned)h<<16; float f; memcpy(&f,&u,4); return f; }
@@ -59,17 +60,17 @@ static inline int tap_slot(int L){ for(int j=0;j<6;++j) if(TAP_LAYERS[j]==L) ret
 
 // ---- KV-cache decode kernels ----
 // store projected K/V (fp32 [m,nkv,hd]) into BF16 cache at positions [base, base+m)
-__global__ void k_store_kv(uint16_t* cache, const float* src, int base, int m, int nkv, int hd){
+__global__ void k_store_kv(uint16_t* cache, const float* src, int m, int nkv, int hd){
     int i=blockIdx.x*blockDim.x+threadIdx.x; int n=m*nkv*hd; if(i>=n)return;
     int t=i/(nkv*hd), rest=i%(nkv*hd);
-    float v=src[i]; unsigned u; memcpy(&u,&v,4); cache[(size_t)(base+t)*nkv*hd + rest]=(uint16_t)(u>>16);
+    float v=src[i]; unsigned u; memcpy(&u,&v,4); cache[(size_t)(g_base+t)*nkv*hd + rest]=(uint16_t)(u>>16);
 }
 // single-query-block attention over a BF16 KV cache. query i (abs pos base+i) attends keys [lo, base+i].
 // out[m,nh,hd], Q[m,nh,hd] fp32; Kc/Vc[CAP,nkv,hd] bf16. window=0 => full causal.
 __global__ void sdpa_cache_kernel(float* out, const float* Q, const uint16_t* Kc, const uint16_t* Vc,
-                                  int m, int base, int nkv, int nh, int hd, int window, float scaling){
+                                  int m, int nkv, int nh, int hd, int window, float scaling){
     int i=blockIdx.x, h=blockIdx.y; if(i>=m||h>=nh) return;
-    int p=base+i, kvh=h/(nh/nkv); int lo=(window>0)?max(0,p-window+1):0;
+    int p=g_base+i, kvh=h/(nh/nkv); int lo=(window>0)?max(0,p-window+1):0;
     extern __shared__ float sh[]; float* Qs=sh; float* acc=sh+hd; float* red=sh+2*hd;
     int d=threadIdx.x;
     Qs[d]=Q[((size_t)i*nh+h)*hd+d]; acc[d]=0.f; __syncthreads();
@@ -112,6 +113,8 @@ __global__ void k_argmax(int* out,const float* lg,int V){
     if(threadIdx.x==0) out[p]=si[0];
 }
 
+// CUDA-graph self-advance: feed argmax back as next input token + increment position (all on-device)
+__global__ void k_advance(int* dids,const int* darg){ if(threadIdx.x==0){ dids[0]=darg[0]; g_base++; } }
 // ---- device-MoE kernels (no host round-trip; indexes expert weights by device top-8 ids) ----
 __device__ __forceinline__ float e2m1d(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
 __device__ __forceinline__ __half2 dec_fp4x2(unsigned char b){ __half2_raw r=__nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)b,__NV_E2M1); return *reinterpret_cast<__half2*>(&r); }
@@ -362,7 +365,8 @@ static void rope_tables(int seq,int head_dim,double theta,int rope_angles,float*
 }
 
 // device rope cos/sin tables into pre-allocated dc/ds [mtok, head_dim/2] for absolute positions base..base+mtok
-__global__ void k_rope_tables(float* dc,float* ds,int base,int head_dim,double theta,int rope_angles){
+__global__ void k_rope_tables(float* dc,float* ds,int head_dim,double theta,int rope_angles){
+    int base=g_base;
     int p=blockIdx.x,j=threadIdx.x,half=head_dim/2; if(j>=half)return;
     double inv=(j<rope_angles)?1.0/pow(theta,(2.0*j)/head_dim):0.0; double a=(double)(base+p)*inv;
     dc[(size_t)p*half+j]=cosf(a); ds[(size_t)p*half+j]=sinf(a);
@@ -386,13 +390,13 @@ static void attention_cached(Model& m, Session& S, float* h, int mtok, int base,
     rmsnorm(k, k, m.dptr<const uint16_t*>(P+"self_attn.k_norm.weight"), mtok*nkv, hd, EPS, 0);
     rmsnorm(v, v, (const uint16_t*)nullptr, mtok*nkv, hd, EPS, 0); // v_norm no scale
     double theta=is_full(L)?1e6:1e4; int rang=is_full(L)?64:128;
-    k_rope_tables<<<mtok,hd/2>>>(dc, ds, base, hd, theta, rang);
+    k_rope_tables<<<mtok,hd/2>>>(dc, ds, hd, theta, rang);   // reads g_base
     rope_rotate_half(q, dc, ds, mtok, NHEAD, hd, hd, 0);
     rope_rotate_half(k, dc, ds, mtok, nkv,   hd, hd, 0);
-    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Kc[L], k, base, mtok, nkv, hd);
-    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Vc[L], v, base, mtok, nkv, hd);
+    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Kc[L], k, mtok, nkv, hd);   // reads g_base
+    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Vc[L], v, mtok, nkv, hd);
     int shmem=(2*hd+ (hd>256?hd:256))*4; dim3 grid(mtok,NHEAD);
-    sdpa_cache_kernel<<<grid,hd,shmem>>>(ao, q, S.Kc[L], S.Vc[L], mtok, base, nkv, NHEAD, hd, is_full(L)?0:SWIN, 1.0f);
+    sdpa_cache_kernel<<<grid,hd,shmem>>>(ao, q, S.Kc[L], S.Vc[L], mtok, nkv, NHEAD, hd, is_full(L)?0:SWIN, 1.0f);   // reads g_base
     linear(m, op, ao, P+"self_attn.o_proj", mtok, H, qd);
     rmsnorm(op, op, m.dptr<const uint16_t*>(P+"post_attention_layernorm.weight"), mtok, H, EPS, 0);
     add_inplace(h, op, mtok*H, 0);   // no sync: all on stream 0, ordered
@@ -475,6 +479,7 @@ int main(int argc,char**argv){
         int* dids; float* h;
         if(big){ CU(cudaMalloc(&dids,mtok*4)); CU(cudaMalloc(&h,(size_t)mtok*H*4)); } else { dids=DS->dids; h=DS->hmain; }
         CU(cudaMemcpyAsync(dids,nids.data(),mtok*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpyToSymbol(g_base,&base,sizeof(int)));   // set decode position read by base-dependent kernels
         k_embed<<<mtok,256>>>(h, m.dptr<const uint16_t*>(embn), dids, mtok, H, EMB_SCALE);
         static double t_layers=0,t_head=0; bool prof=getenv("PROF");
         cudaEvent_t a,b,c; if(prof){cudaEventCreate(&a);cudaEventCreate(&b);cudaEventCreate(&c);cudaDeviceSynchronize();cudaEventRecord(a);}
@@ -511,13 +516,46 @@ int main(int argc,char**argv){
     }
     int ngen=0;
     if(!getenv("DFLASH")){
-        // ---- base incremental decode ----
+        // ---- base incremental decode, CUDA-graph captured (one captured step replays for all positions) ----
+        uint16_t* embw=m.dptr<uint16_t*>(embn);
+        auto decode_step=[&](){   // mtok=1, reads DS->dids (token) + g_base (pos), writes DS->darg, self-advances
+            k_embed<<<1,256>>>(DS->hmain, embw, DS->dids, 1, H, EMB_SCALE);
+            float* h=DS->hmain;
+            for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,1,0,L); moe(m,h,1,L); }
+            rmsnorm(DS->hl, h, m.dptr<const uint16_t*>("model.language_model.norm.weight"), 1, H, EPS, 0);
+            k_lmhead<<<VOCAB,256>>>(DS->dlog, DS->hl, embw, H, VOCAB, SOFTCAP);
+            k_argmax<<<1,256>>>(DS->darg, DS->dlog, VOCAB);
+            k_advance<<<1,1>>>(DS->dids, DS->darg);
+        };
+        bool useGraph = !getenv("NOGRAPH");
         cudaEventRecord(t0);
-        for(int g=0; g<NGEN; ++g){
-            printf("%d ",tok); fflush(stdout); ngen++;
-            if(tok==1||tok==106) break;
-            int nexttok; run(std::vector<int>{tok}, S->valid_len, logits, nullptr, nullptr, &nexttok);
-            S->valid_len += 1; tok = nexttok;
+        int g=0;
+        printf("%d ",tok); fflush(stdout); ngen++;   // print tok0; warmup 1 eager step (lazy init + advance)
+        if(tok==1||tok==106) useGraph=false;
+        else { int nt; run(std::vector<int>{tok}, S->valid_len, logits, nullptr, nullptr, &nt); S->valid_len++; tok=nt; g=1; }
+        if(useGraph){
+            CU(cudaMemcpy(DS->dids,&tok,4,cudaMemcpyHostToDevice));
+            CU(cudaMemcpyToSymbol(g_base,&S->valid_len,sizeof(int)));
+            cudaGraph_t graph; cudaGraphExec_t exec;
+            CU(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+            decode_step();
+            CU(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+            CU(cudaGraphInstantiate(&exec,graph,0));
+            for(; g<NGEN; ++g){
+                printf("%d ",tok); fflush(stdout); ngen++;
+                if(tok==1||tok==106) break;
+                CU(cudaGraphLaunch(exec,cudaStreamPerThread));
+                CU(cudaMemcpyAsync(&tok,DS->darg,4,cudaMemcpyDeviceToHost,cudaStreamPerThread));
+                CU(cudaStreamSynchronize(cudaStreamPerThread));
+                S->valid_len += 1;
+            }
+            cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+        } else {   // eager fallback (NOGRAPH=1 or EOS)
+            for(; g<NGEN; ++g){
+                printf("%d ",tok); fflush(stdout); ngen++;
+                if(tok==1||tok==106) break;
+                int nt; run(std::vector<int>{tok}, S->valid_len, logits, nullptr, nullptr, &nt); S->valid_len++; tok=nt;
+            }
         }
         cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
         printf("\n[base decode %d tok in %.1f ms = %.2f tok/s]\n", ngen, ms, ngen*1000.0/ms);
