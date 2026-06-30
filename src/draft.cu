@@ -1,0 +1,243 @@
+// draft.cu — DFlash draft model forward + propose (qwen3-style, 5 layers).
+// Self-contained: BF16 weights decoded via (uint16<<16), fp32 activations,
+// simple correctness-first kernels. Follows reference/DFLASH_SPEC.md exactly.
+//
+// Algorithm (single forward, parallel block-diffusion drafting):
+//   (A) context K/V:  fused = fc @ concat6(taps); fused_n = rmsnorm(fused, hidden_norm);
+//                     for each layer: K/V = k/v_proj @ fused_n; k_norm; RoPE(K) (V not roped);
+//                     store into draft KV cache at ctx_pos.  (Every layer's K/V from same fused_n.)
+//   (B) query forward: qids=[next_token, 4x15]; h=embed(qids) UNSCALED;
+//                     5 qwen3 decoder layers (input_ln; q/k/v; q/k_norm; RoPE; append query K/V;
+//                     NON-CAUSAL attn over context ∪ block, scale 1/sqrt(128); o_proj; resid;
+//                     post_attn_ln; SiLU MLP; resid); final norm.
+//   (C) logits = lm_head @ h[mask slots 1..15]; argmax -> draft ids.
+#include "draft.h"
+#include "safetensors.h"
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <string>
+#include <vector>
+
+#define CU(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
+
+// ---- qwen3 draft config (DFLASH_SPEC.md §0) ----
+static const int H=2816, NL=5, NH=32, HD=128, NKV=8;
+static const int QD=NH*HD /*4096*/, KD=NKV*HD /*1024*/, FFN=5632, FCIN=6*H /*16896*/;
+static const int VOCAB=262144, MASK=4, BLK=16, NDRAFT=15;
+static const float EPS=1e-6f, THETA=1e6f;
+static const float SCALE=0.08838834764831845f;  // 1/sqrt(128)
+
+__device__ __forceinline__ float bf2f(uint16_t h){ unsigned u=(unsigned)h<<16; float f; memcpy(&f,&u,4); return f; }
+
+// ---------------- kernels ----------------
+// out[M,N] = x[M,K] @ W_bf16[N,K]^T   (one thread per output element, loop over K)
+__global__ void k_linear_bf16(float* out,const float* x,const uint16_t* W,int M,int N,int K){
+    int n=blockIdx.x*blockDim.x+threadIdx.x; int m=blockIdx.y; if(n>=N||m>=M)return;
+    const float* xr=x+(size_t)m*K; const uint16_t* wr=W+(size_t)n*K;
+    float acc=0.f; for(int k=0;k<K;++k) acc+=xr[k]*bf2f(wr[k]);
+    out[(size_t)m*N+n]=acc;
+}
+// RMSNorm: out = x*rsqrt(mean(x^2)+eps) [* bf16 weight if w!=null]. One block per row over `dim`.
+__global__ void k_rmsnorm(float* out,const float* x,const uint16_t* w,int dim,float eps){
+    int row=blockIdx.x; const float* xr=x+(size_t)row*dim; float* o=out+(size_t)row*dim;
+    __shared__ float ss[256]; float local=0.f;
+    for(int i=threadIdx.x;i<dim;i+=blockDim.x){ float v=xr[i]; local+=v*v; }
+    ss[threadIdx.x]=local; __syncthreads();
+    for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)ss[threadIdx.x]+=ss[threadIdx.x+s]; __syncthreads(); }
+    float inv=rsqrtf(ss[0]/dim+eps);
+    for(int i=threadIdx.x;i<dim;i+=blockDim.x){ float v=xr[i]*inv; if(w)v*=bf2f(w[i]); o[i]=v; }
+}
+// fused residual add: resid += h  (resid becomes the new residual stream r_new)
+__global__ void k_add(float* acc,const float* in,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n)acc[i]+=in[i]; }
+// embed query ids, UNSCALED (no sqrt(2816)); see DFLASH_SPEC.md Q7 Q-embed note
+__global__ void k_embed_unscaled(float* out,const uint16_t* emb,const int* ids,int seq,float esc){
+    int t=blockIdx.x; for(int j=threadIdx.x;j<H;j+=blockDim.x) out[(size_t)t*H+j]=bf2f(emb[(size_t)ids[t]*H+j])*esc;
+}
+// rotate-half (neox) RoPE: x[rows,nh,hd], pairs dim i with i+hd/2. cos/sin: [rows, hd/2].
+__global__ void k_rope(float* x,const float* cosT,const float* sinT,int nh,int hd){
+    int r=blockIdx.y,h=blockIdx.x,half=hd/2,i=threadIdx.x; if(i>=half)return;
+    float* xh=x+(((size_t)r*nh+h)*hd);
+    const float* c=cosT+(size_t)r*half; const float* sn=sinT+(size_t)r*half;
+    float x0=xh[i],x1=xh[i+half],cc=c[i],ss=sn[i];
+    xh[i]=x0*cc-x1*ss; xh[i+half]=x1*cc+x0*ss;
+}
+// store K/V (fp32 [m,nkv,hd]) into contiguous cache at slot positions slots[t]
+__global__ void k_store_kv(float* cache,const float* src,const int* slots,int m,int nkv,int hd){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; int n=m*nkv*hd; if(i>=n)return;
+    int t=i/(nkv*hd), rest=i%(nkv*hd);
+    cache[(size_t)slots[t]*nkv*hd + rest]=src[i];
+}
+// NON-CAUSAL attention: query i (0..BLK-1), head h. Attends to all `nkeys` cache slots in kslots.
+// Q[BLK,nh,hd] fp32, cache K/V [.,nkv,hd] fp32. Online softmax. block=hd threads.
+__global__ void k_attn(float* out,const float* Q,const float* Kc,const float* Vc,
+                       const int* kslots,int nkeys,int nh,int nkv,int hd,float scale){
+    int i=blockIdx.x,h=blockIdx.y,d=threadIdx.x; int kvh=h/(nh/nkv);
+    extern __shared__ float sh[]; float* Qs=sh; float* acc=sh+hd; float* red=sh+2*hd;
+    Qs[d]=Q[((size_t)i*nh+h)*hd+d]; acc[d]=0.f; __syncthreads();
+    float m_run=-1e30f,l_run=0.f;
+    for(int j=0;j<nkeys;++j){
+        int slot=kslots[j];
+        red[d]=Qs[d]*Kc[((size_t)slot*nkv+kvh)*hd+d]; __syncthreads();
+        for(int s=hd/2;s>0;s>>=1){ if(d<s)red[d]+=red[d+s]; __syncthreads(); }
+        float score=red[0]*scale;
+        float nm=fmaxf(m_run,score), corr=__expf(m_run-nm), pj=__expf(score-nm);
+        l_run=l_run*corr+pj;
+        acc[d]=acc[d]*corr+pj*Vc[((size_t)slot*nkv+kvh)*hd+d]; m_run=nm; __syncthreads();
+    }
+    out[((size_t)i*nh+h)*hd+d]=acc[d]/l_run;
+}
+// SiLU-gate: g = silu(g) * u   (silu(x)=x*sigmoid(x))
+__global__ void k_silu_mul(float* g,const float* u,int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n)return; float x=g[i]; g[i]=(x/(1.f+__expf(-x)))*u[i];
+}
+
+// ---------------- model ----------------
+struct DraftModel {
+    st::SafeTensors* st; uint8_t* draw; const uint8_t* h0; int cap, slots;
+    float* Kc[NL]; float* Vc[NL];
+    DraftModel(const char* path,int cap_):cap(cap_){
+        st=new st::SafeTensors(path); h0=st->dataStart();
+        CU(cudaMalloc(&draw, st->dataBytes()));
+        CU(cudaMemcpy(draw, h0, st->dataBytes(), cudaMemcpyHostToDevice));
+        slots=cap+BLK;
+        for(int l=0;l<NL;++l){ size_t sz=(size_t)slots*NKV*HD*4;
+            CU(cudaMalloc(&Kc[l],sz)); CU(cudaMalloc(&Vc[l],sz)); }
+        printf("draft: uploaded %.2f GB weights, KV cache %d slots x %d layers\n",
+               st->dataBytes()/1e9, slots, NL);
+    }
+    template<class P> P dptr(const std::string& n){ return (P)(draw + (st->get(n).data - h0)); }
+};
+
+DraftModel* draft_load(const char* path,int cap){ return new DraftModel(path,cap); }
+void draft_free(DraftModel* d){ if(d){ delete d->st; delete d; } }
+
+// ---- helpers ----
+static void linbf(DraftModel* d,float* out,const float* x,const std::string& wname,int M,int N,int K){
+    const uint16_t* W=d->dptr<const uint16_t*>(wname);
+    dim3 grid((N+255)/256, M); k_linear_bf16<<<grid,256>>>(out,x,W,M,N,K);
+}
+static void rmsn(DraftModel* d,float* out,const float* x,const std::string& wname,int rows,int dim){
+    const uint16_t* w = wname.empty()? nullptr : d->dptr<const uint16_t*>(wname);
+    k_rmsnorm<<<rows,256>>>(out,x,w,dim,EPS);
+}
+// RoPE cos/sin tables from explicit absolute positions (theta=1e6, head_dim=128, all dims rotated)
+static void rope_tables(const int* pos,int n,float** dc,float** ds){
+    int half=HD/2; std::vector<float> c((size_t)n*half), s((size_t)n*half);
+    for(int r=0;r<n;++r) for(int j=0;j<half;++j){
+        double inv=1.0/pow((double)THETA,(2.0*j)/HD); double a=(double)pos[r]*inv;
+        c[(size_t)r*half+j]=(float)cos(a); s[(size_t)r*half+j]=(float)sin(a);
+    }
+    CU(cudaMalloc(dc,(size_t)n*half*4)); CU(cudaMalloc(ds,(size_t)n*half*4));
+    CU(cudaMemcpy(*dc,c.data(),(size_t)n*half*4,cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(*ds,s.data(),(size_t)n*half*4,cudaMemcpyHostToDevice));
+}
+static std::string LP(int l,const char* s){ return "layers."+std::to_string(l)+"."+s; }
+
+// ---------------- propose ----------------
+void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int C,
+                   int next_token, const uint16_t* embed_bf16, const uint16_t* lmhead_bf16,
+                   int* out_ids, int k){
+    if(k>NDRAFT) k=NDRAFT;
+    int P0 = ctx_pos[C-1]+1;
+
+    // ---- (A) context K/V into draft cache ----
+    // fused = fc @ concat6(taps)   (taps[C,6,2816] is already concat -> [C,16896])
+    float *fused,*fused_n; CU(cudaMalloc(&fused,(size_t)C*H*4)); CU(cudaMalloc(&fused_n,(size_t)C*H*4));
+    linbf(d, fused, taps_dev, "fc.weight", C, H, FCIN);
+    rmsn(d, fused_n, fused, "hidden_norm.weight", C, H);
+    // context positions on device (slots) + RoPE tables for them
+    int* ctx_dev; CU(cudaMalloc(&ctx_dev,C*4)); CU(cudaMemcpy(ctx_dev,ctx_pos,C*4,cudaMemcpyHostToDevice));
+    float *cdc,*cds; rope_tables(ctx_pos,C,&cdc,&cds);
+    float *Kctx,*Vctx; CU(cudaMalloc(&Kctx,(size_t)C*KD*4)); CU(cudaMalloc(&Vctx,(size_t)C*KD*4));
+    for(int l=0;l<NL;++l){
+        linbf(d, Kctx, fused_n, LP(l,"self_attn.k_proj.weight"), C, KD, H);
+        linbf(d, Vctx, fused_n, LP(l,"self_attn.v_proj.weight"), C, KD, H);
+        rmsn(d, Kctx, Kctx, LP(l,"self_attn.k_norm.weight"), C*NKV, HD);   // per-head k_norm
+        { dim3 g(NKV,C); k_rope<<<g,HD/2>>>(Kctx,cdc,cds,NKV,HD); }        // V NOT roped
+        k_store_kv<<<(C*KD+255)/256,256>>>(d->Kc[l],Kctx,ctx_dev,C,NKV,HD);
+        k_store_kv<<<(C*KD+255)/256,256>>>(d->Vc[l],Vctx,ctx_dev,C,NKV,HD);
+    }
+    CU(cudaDeviceSynchronize());
+
+    // ---- (B) query forward over BLK tokens ----
+    // qids = [next_token, MASK x15];  qpos = [P0 .. P0+15]
+    std::vector<int> qids(BLK), qpos(BLK), qslot(BLK);
+    qids[0]=next_token; for(int i=1;i<BLK;++i) qids[i]=MASK;
+    for(int i=0;i<BLK;++i){ qpos[i]=P0+i; qslot[i]=P0+i; }
+    int *qid_dev,*qslot_dev; CU(cudaMalloc(&qid_dev,BLK*4)); CU(cudaMalloc(&qslot_dev,BLK*4));
+    CU(cudaMemcpy(qid_dev,qids.data(),BLK*4,cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(qslot_dev,qslot.data(),BLK*4,cudaMemcpyHostToDevice));
+    // key slot list for attention = context positions ∪ block positions  (non-causal)
+    std::vector<int> kslots; kslots.reserve(C+BLK);
+    for(int i=0;i<C;++i) kslots.push_back(ctx_pos[i]);
+    for(int i=0;i<BLK;++i) kslots.push_back(P0+i);
+    int nkeys=kslots.size(); int* kslot_dev; CU(cudaMalloc(&kslot_dev,nkeys*4));
+    CU(cudaMemcpy(kslot_dev,kslots.data(),nkeys*4,cudaMemcpyHostToDevice));
+    float *qdc,*qds; rope_tables(qpos.data(),BLK,&qdc,&qds);
+
+    float *h,*resid,*hn,*q,*kk,*vv,*ao,*attn,*g,*u;
+    CU(cudaMalloc(&h,(size_t)BLK*H*4));    CU(cudaMalloc(&resid,(size_t)BLK*H*4));
+    CU(cudaMalloc(&hn,(size_t)BLK*H*4));   CU(cudaMalloc(&q,(size_t)BLK*QD*4));
+    CU(cudaMalloc(&kk,(size_t)BLK*KD*4));  CU(cudaMalloc(&vv,(size_t)BLK*KD*4));
+    CU(cudaMalloc(&ao,(size_t)BLK*QD*4));  CU(cudaMalloc(&attn,(size_t)BLK*H*4));
+    CU(cudaMalloc(&g,(size_t)BLK*FFN*4));  CU(cudaMalloc(&u,(size_t)BLK*FFN*4));
+
+    // EMPIRICAL: draft wants SCALED embeddings (sqrt(2816)) — tau 4.0 vs 2.67 unscaled, despite
+    // DFLASH_SPEC.md Q7's UNSCALED guess. Default scaled; DEMB_OFF=1 reverts to unscaled.
+    float esc = getenv("DEMB_OFF") ? 1.0f : 53.06599664f;
+    k_embed_unscaled<<<BLK,256>>>(h, embed_bf16, qid_dev, BLK, esc);
+    CU(cudaMemset(resid,0,(size_t)BLK*H*4));   // running residual stream (r_new = resid + h)
+    int shmem=3*HD*4; dim3 agrid(BLK,NH);
+
+    for(int l=0;l<NL;++l){
+        // input_layernorm fused: resid += h; hn = rmsnorm(resid)
+        k_add<<<(BLK*H+255)/256,256>>>(resid,h,BLK*H);
+        rmsn(d, hn, resid, LP(l,"input_layernorm.weight"), BLK, H);
+        // attention
+        linbf(d, q,  hn, LP(l,"self_attn.q_proj.weight"), BLK, QD, H);
+        linbf(d, kk, hn, LP(l,"self_attn.k_proj.weight"), BLK, KD, H);
+        linbf(d, vv, hn, LP(l,"self_attn.v_proj.weight"), BLK, KD, H);
+        rmsn(d, q,  q,  LP(l,"self_attn.q_norm.weight"), BLK*NH,  HD);   // per-head q_norm
+        rmsn(d, kk, kk, LP(l,"self_attn.k_norm.weight"), BLK*NKV, HD);   // per-head k_norm
+        k_rope<<<dim3(NH,BLK),HD/2>>>(q, qdc,qds,NH, HD);
+        k_rope<<<dim3(NKV,BLK),HD/2>>>(kk,qdc,qds,NKV,HD);
+        // append query K/V to cache at P0..P0+15 (V not roped)
+        k_store_kv<<<(BLK*KD+255)/256,256>>>(d->Kc[l],kk,qslot_dev,BLK,NKV,HD);
+        k_store_kv<<<(BLK*KD+255)/256,256>>>(d->Vc[l],vv,qslot_dev,BLK,NKV,HD);
+        // non-causal attention over context ∪ block
+        k_attn<<<agrid,HD,shmem>>>(ao,q,d->Kc[l],d->Vc[l],kslot_dev,nkeys,NH,NKV,HD,SCALE);
+        linbf(d, attn, ao, LP(l,"self_attn.o_proj.weight"), BLK, H, QD);
+        // post_attention_layernorm fused: resid += attn; hn = rmsnorm(resid)
+        k_add<<<(BLK*H+255)/256,256>>>(resid,attn,BLK*H);
+        rmsn(d, hn, resid, LP(l,"post_attention_layernorm.weight"), BLK, H);
+        // SiLU MLP: down(silu(gate@hn) * (up@hn))
+        linbf(d, g, hn, LP(l,"mlp.gate_proj.weight"), BLK, FFN, H);
+        linbf(d, u, hn, LP(l,"mlp.up_proj.weight"),   BLK, FFN, H);
+        k_silu_mul<<<(BLK*FFN+255)/256,256>>>(g,u,BLK*FFN);
+        linbf(d, h, g, LP(l,"mlp.down_proj.weight"), BLK, H, FFN);  // h = mlp output -> next layer
+    }
+    // final norm: resid += h; out = rmsnorm(resid, norm)
+    k_add<<<(BLK*H+255)/256,256>>>(resid,h,BLK*H);
+    float* hfin; CU(cudaMalloc(&hfin,(size_t)BLK*H*4));
+    rmsn(d, hfin, resid, "norm.weight", BLK, H);
+    CU(cudaDeviceSynchronize());
+
+    // ---- (C) logits for the 15 MASK positions (query slots 1..15) -> argmax ----
+    float* hmask = hfin + (size_t)1*H;   // rows 1..15
+    float* logits; CU(cudaMalloc(&logits,(size_t)NDRAFT*VOCAB*4));
+    { dim3 grid((VOCAB+255)/256, NDRAFT); k_linear_bf16<<<grid,256>>>(logits,hmask,lmhead_bf16,NDRAFT,VOCAB,H); }
+    CU(cudaDeviceSynchronize());
+    std::vector<float> hl((size_t)NDRAFT*VOCAB);
+    CU(cudaMemcpy(hl.data(),logits,(size_t)NDRAFT*VOCAB*4,cudaMemcpyDeviceToHost));
+    for(int r=0;r<k;++r){ const float* row=&hl[(size_t)r*VOCAB]; int best=0;
+        for(int v=1;v<VOCAB;++v) if(row[v]>row[best]) best=v; out_ids[r]=best; }
+
+    cudaFree(fused);cudaFree(fused_n);cudaFree(ctx_dev);cudaFree(cdc);cudaFree(cds);
+    cudaFree(Kctx);cudaFree(Vctx);cudaFree(qid_dev);cudaFree(qslot_dev);cudaFree(kslot_dev);
+    cudaFree(qdc);cudaFree(qds);cudaFree(h);cudaFree(resid);cudaFree(hn);cudaFree(q);
+    cudaFree(kk);cudaFree(vv);cudaFree(ao);cudaFree(attn);cudaFree(g);cudaFree(u);
+    cudaFree(hfin);cudaFree(logits);
+}

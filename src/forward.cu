@@ -6,6 +6,7 @@
 #include "nvfp4_quant.h"
 #include "elementwise.h"
 #include "attention.h"
+#include "draft.h"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +44,14 @@ __global__ void k_lmhead(float* logits,const float* hlast,const uint16_t* emb,in
     red[threadIdx.x]=acc; __syncthreads();
     for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
     if(threadIdx.x==0){ float x=red[0]; logits[v]=cap*tanhf(x/cap); } }
+
+// DFlash: capture residual after a tapped target layer into taps[mtok,6,H] at tap slot j
+__global__ void k_tap(float* taps, const float* h, int mtok, int j, int H){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=mtok*H)return; int t=i/H,d=i%H;
+    taps[((size_t)t*6 + j)*H + d] = h[i];
+}
+static const int TAP_LAYERS[6]={1,6,11,17,22,27};
+static inline int tap_slot(int L){ for(int j=0;j<6;++j) if(TAP_LAYERS[j]==L) return j; return -1; }
 
 // ---- KV-cache decode kernels ----
 // store projected K/V (fp32 [m,nkv,hd]) into BF16 cache at positions [base, base+m)
@@ -292,7 +301,8 @@ int main(int argc,char**argv){
     int NGEN = getenv("GEN")? atoi(getenv("GEN")) : 0;
     const char* embn="model.language_model.embed_tokens.weight";
     // run mtok tokens at positions [base, base+mtok); fill logits_out for the LAST token; updates KV cache
-    auto run=[&](const std::vector<int>& nids,int base,std::vector<float>& lo){
+    // per-position argmax (verify): for each of the mtok positions, target's greedy next-token
+    auto run=[&](const std::vector<int>& nids,int base,std::vector<float>& lo,float* taps=nullptr,std::vector<int>* allarg=nullptr){
         int mtok=nids.size();
         int* dids; CU(cudaMalloc(&dids,mtok*4)); CU(cudaMemcpy(dids,nids.data(),mtok*4,cudaMemcpyHostToDevice));
         float* h; CU(cudaMalloc(&h,(size_t)mtok*H*4));
@@ -300,7 +310,8 @@ int main(int argc,char**argv){
         CU(cudaDeviceSynchronize());
         static double t_layers=0,t_head=0; bool prof=getenv("PROF");
         cudaEvent_t a,b,c; if(prof){cudaEventCreate(&a);cudaEventCreate(&b);cudaEventCreate(&c);cudaEventRecord(a);}
-        for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,mtok,base,L); moe(m,h,mtok,L); }
+        for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,mtok,base,L); moe(m,h,mtok,L);
+            if(taps){ int j=tap_slot(L); if(j>=0) k_tap<<<(mtok*H+255)/256,256>>>(taps,h,mtok,j,H); } }
         if(prof){cudaEventRecord(b);}
         float* hl; CU(cudaMalloc(&hl,H*4));
         rmsnorm(hl, h+(size_t)(mtok-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"),1,H,EPS,0);
@@ -310,13 +321,19 @@ int main(int argc,char**argv){
         lo.resize(VOCAB); CU(cudaMemcpy(lo.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
         if(prof){cudaEventRecord(c);cudaEventSynchronize(c);float ab,bc;cudaEventElapsedTime(&ab,a,b);cudaEventElapsedTime(&bc,b,c);t_layers+=ab;t_head+=bc;
             fprintf(stderr,"[prof] layers=%.1fms head=%.1fms (cum layers=%.0f head=%.0f)\n",ab,bc,t_layers,t_head);}
+        if(allarg){ allarg->resize(mtok); std::vector<float> tmp(VOCAB);
+            for(int p=0;p<mtok;++p){ rmsnorm(hl,h+(size_t)p*H,m.dptr<const uint16_t*>("model.language_model.norm.weight"),1,H,EPS,0);
+                k_lmhead<<<VOCAB,256>>>(dlog,hl,m.dptr<const uint16_t*>(embn),H,VOCAB,SOFTCAP); CU(cudaDeviceSynchronize());
+                CU(cudaMemcpy(tmp.data(),dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost));
+                int b=0; for(int i=1;i<VOCAB;++i) if(tmp[i]>tmp[b])b=i; (*allarg)[p]=b; } }
         cudaFree(dids);cudaFree(h);cudaFree(hl);cudaFree(dlog);
     };
     auto argmax=[&](const std::vector<float>& lg){ int b=0; for(int i=1;i<VOCAB;++i) if(lg[i]>lg[b])b=i; return b; };
     std::vector<float> logits;
-    // prefill the prompt
+    // taps buffer for all committed positions (DFlash context); prefill captures prompt taps
+    float* taps_ctx; CU(cudaMalloc(&taps_ctx,(size_t)(CAP+32)*6*H*4));
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
-    run(ids, 0, logits); S->valid_len = seq;
+    run(ids, 0, logits, taps_ctx); S->valid_len = seq;
     int tok = argmax(logits);
     if(NGEN==0){
         double mx=-1e30; for(float v:logits)mx=std::max(mx,(double)v); double Z=0; for(float v:logits)Z+=exp((double)v-mx);
@@ -326,17 +343,45 @@ int main(int argc,char**argv){
         for(int j=0;j<5;++j){ int id=ord[j]; double lp=(double)logits[id]-mx-log(Z); printf("  %6d : %8.4f : %8.4f\n",id,logits[id],lp); }
         return 0;
     }
-    // decode loop (incremental, KV-cached)
-    cudaEventRecord(t0);
     int ngen=0;
-    for(int g=0; g<NGEN; ++g){
-        printf("%d ",tok); fflush(stdout); ngen++;
-        if(tok==1||tok==106) break;
-        run(std::vector<int>{tok}, S->valid_len, logits);
-        S->valid_len += 1; tok = argmax(logits);
+    if(!getenv("DFLASH")){
+        // ---- base incremental decode ----
+        cudaEventRecord(t0);
+        for(int g=0; g<NGEN; ++g){
+            printf("%d ",tok); fflush(stdout); ngen++;
+            if(tok==1||tok==106) break;
+            run(std::vector<int>{tok}, S->valid_len, logits);
+            S->valid_len += 1; tok = argmax(logits);
+        }
+        cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
+        printf("\n[base decode %d tok in %.1f ms = %.2f tok/s]\n", ngen, ms, ngen*1000.0/ms);
+    } else {
+        // ---- DFlash speculative decode (k drafts/block) ----
+        int k = getenv("DK")?atoi(getenv("DK")):15; k=std::max(1,std::min(15,k));
+        DraftModel* dm = draft_load((std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-DFlash/model.safetensors").c_str(), CAP+32);
+        uint16_t* embed = m.dptr<uint16_t*>(embn);
+        float* taps_blk; CU(cudaMalloc(&taps_blk,(size_t)(k+1)*6*H*4));
+        std::vector<int> draft_ids(k), allarg, ctxpos;
+        int steps=0, accepted_sum=0;
+        cudaEventRecord(t0);
+        while(ngen<NGEN){
+            ctxpos.resize(S->valid_len); for(int i=0;i<S->valid_len;++i) ctxpos[i]=i;
+            draft_propose(dm, taps_ctx, ctxpos.data(), S->valid_len, tok, embed, embed, draft_ids.data(), k);
+            std::vector<int> block; block.reserve(k+1); block.push_back(tok);
+            for(int i=0;i<k;++i) block.push_back(draft_ids[i]);
+            run(block, S->valid_len, logits, taps_blk, &allarg);   // caches block KV, taps_blk[0..k], allarg[0..k]
+            int na=0; for(int i=0;i<k;++i){ if(draft_ids[i]==allarg[i]) na++; else break; }
+            int newbonus = allarg[na];
+            printf("%d ",tok); fflush(stdout); ngen++;
+            bool stop = (tok==1||tok==106);
+            for(int i=0;i<na && ngen<NGEN && !stop;++i){ printf("%d ",draft_ids[i]); ngen++; stop=(draft_ids[i]==1||draft_ids[i]==106); }
+            CU(cudaMemcpy(taps_ctx+(size_t)S->valid_len*6*H, taps_blk, (size_t)(na+1)*6*H*4, cudaMemcpyDeviceToDevice));
+            S->valid_len += 1+na; tok = newbonus; steps++; accepted_sum += na;
+            if(stop) break;
+        }
+        cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
+        printf("\n[dflash decode %d tok in %.1f ms = %.2f tok/s | %d steps, mean accept %.2f drafts/block (k=%d), tau=%.2f]\n",
+               ngen, ms, ngen*1000.0/ms, steps, steps?(double)accepted_sum/steps:0, k, steps?(double)ngen/steps:0);
     }
-    cudaEventRecord(t1); cudaEventSynchronize(t1);
-    float ms=0; cudaEventElapsedTime(&ms,t0,t1);
-    printf("\n[decode %d tokens in %.1f ms = %.2f tok/s]\n", ngen, ms, ngen*1000.0/ms);
     return 0;
 }
