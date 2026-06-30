@@ -32,3 +32,8 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   launches/step). Build needs `--default-stream per-thread` (scripts/build.sh). NOGRAPH=1 = eager fallback.
 - correctness: PASS | base 30.73 -> **34.18 tok/s (+11.2%)** | **CHAMPION** | launch-overhead was ~24% of step;
   CUDA_LAUNCH_BLOCKING probe (30.4->17.8) confirmed launch-sensitivity. DFlash unaffected (eager).
+
+### [3] MoE gateup ILP (2 accumulators + 2-wide vi unroll)  — LOST
+- ncu: gateup 9.74% mem / 32% compute = LATENCY-bound (247us x 30 = 7.4ms/step). Tried 2 fp32 accumulators +
+  2-wide vi unroll for ILP. correctness PASS but base 34.18 -> 33.55 (REGRESSED, likely register pressure).
+  Discarded, reverted. Champion stays 34.18. NEXT: check gateup occupancy/registers; or different ILP shape.
