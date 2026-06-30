@@ -112,21 +112,24 @@ __global__ void k_argmax(int* out,const float* lg,int V){
 // ---- device-MoE kernels (no host round-trip; indexes expert weights by device top-8 ids) ----
 __device__ __forceinline__ float e2m1d(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
 __device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
-// router scores[mtok,NE] = (rmsnorm_noscale(resid)*router_scale*H^-0.5) @ router_proj^T
-__global__ void k_router_scores(float* scores,const float* resid,const uint16_t* rproj,const uint16_t* rscale,int mtok,int H,int NE){
-    int t=blockIdx.x; const float* x=resid+(size_t)t*H;
-    extern __shared__ float sh[]; float* hn=sh; float* red=sh+H;
+// router hidden: hn[mtok,H] = rmsnorm_noscale(resid) * router_scale * H^-0.5  (one block/token)
+__global__ void k_router_hn(float* hn,const float* resid,const uint16_t* rscale,int mtok,int H){
+    int t=blockIdx.x; const float* x=resid+(size_t)t*H; __shared__ float red[256];
     float ls=0; for(int i=threadIdx.x;i<H;i+=blockDim.x) ls+=x[i]*x[i];
     red[threadIdx.x]=ls; __syncthreads();
     for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
     float inv=rsqrtf(red[0]/H+1e-6f), root=rsqrtf((float)H);
-    for(int i=threadIdx.x;i<H;i+=blockDim.x) hn[i]=x[i]*inv*bf2f(rscale[i])*root;
-    __syncthreads();
-    for(int e=0;e<NE;++e){ const uint16_t* w=rproj+(size_t)e*H; float a=0;
-        for(int i=threadIdx.x;i<H;i+=blockDim.x) a+=hn[i]*bf2f(w[i]);
-        red[threadIdx.x]=a; __syncthreads();
-        for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
-        if(threadIdx.x==0) scores[(size_t)t*NE+e]=red[0]; __syncthreads(); }
+    for(int i=threadIdx.x;i<H;i+=blockDim.x) hn[(size_t)t*H+i]=x[i]*inv*bf2f(rscale[i])*root;
+}
+// router scores[mtok,NE] = hn @ router_proj^T, warp-per-(token,expert) (parallel across all experts)
+__global__ void k_router_scores(float* scores,const float* hn,const uint16_t* rproj,int mtok,int H,int NE){
+    int lane=threadIdx.x&31; long o=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+    if(o>=(long)mtok*NE) return; int e=o%NE,t=o/NE;
+    const float* x=hn+(size_t)t*H; const uint16_t* w=rproj+(size_t)e*H; float acc=0;
+    for(int i=lane;i<H;i+=32) acc+=x[i]*bf2f(w[i]);
+    #pragma unroll
+    for(int s=16;s>0;s>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,s);
+    if(lane==0) scores[(size_t)t*NE+e]=acc;
 }
 // softmax over NE -> top-K (by score) -> renorm to sum 1 -> *per_expert_scale. one thread/token.
 __global__ void k_router_top8(int* ids,float* ws,const float* scores,const uint16_t* pes,int NE,int K){
@@ -358,7 +361,8 @@ static void moe(Model& m, float* h, int seq, int L){
     gelu_tanh(g,g,seq*MLP_INT,0); k_mul<<<(seq*MLP_INT+255)/256,256>>>(g,u,seq*MLP_INT);
     linear(m,hs1,g,P+"mlp.down_proj",seq,H,MLP_INT);
     rmsnorm(hs1,hs1,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_1.weight"),seq,H,EPS,0);
-    k_router_scores<<<seq,256,(size_t)(H+256)*4>>>(scores, resid, m.dptr<const uint16_t*>(P+"router.proj.weight"), m.dptr<const uint16_t*>(P+"router.scale"), seq, H, NEXP);
+    k_router_hn<<<seq,256>>>(mi, resid, m.dptr<const uint16_t*>(P+"router.scale"), seq, H);  // reuse mi as hn buffer
+    k_router_scores<<<(unsigned)((seq*NEXP+7)/8),256>>>(scores, mi, m.dptr<const uint16_t*>(P+"router.proj.weight"), seq, H, NEXP);
     k_router_top8<<<seq,1>>>(top8_ids, top8_w, scores, m.dptr<const uint16_t*>(P+"router.per_expert_scale"), NEXP, TOPK);
     rmsnorm(x2,resid,m.dptr<const uint16_t*>(P+"pre_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     ExpertPtrs* ep=m.experts(L);
