@@ -143,26 +143,12 @@ struct Session {
 };
 
 // W4A4 Linear: out_row[M,N] = (in_row[M,K] @ W[N,K]^T) using stored global scales. Pads M>=128.
+// Unified W4A16 Linear (FP4 weight x fp32 activation): out_row[M,N] = dequant(W[N,K]) @ in_row[M,K]^T.
+// Same precision for ALL M (decode, prefill, verify) -> self-consistent + accurate (matches vLLM on ties).
 static void linear(Model& m, float* out_row, const float* in_row, const std::string& prefix, int M, int N, int K){
-    if(M==1){ // decode fast path: FP4-weight GEMV (W4A16), raw weight (byte loads tolerate any alignment)
-        uint8_t* Wp = m.dptr<uint8_t*>(prefix+".weight_packed");
-        uint8_t* Ws = m.dptr<uint8_t*>(prefix+".weight_scale");
-        fp4_gemv(out_row, Wp, Ws, m.scalarF32(prefix+".weight_global_scale"), in_row, N, K, 0);
-        return;
-    }
-    int Mp = M<128?128:M;
-    CU(cudaMemset(SC->in_pad, 0, (size_t)Mp*K*4));
-    CU(cudaMemcpy(SC->in_pad, in_row, (size_t)M*K*4, cudaMemcpyDeviceToDevice));
-    float ig = m.scalarF32(prefix+".input_global_scale");
-    float wg = m.scalarF32(prefix+".weight_global_scale");
-    CU(cudaMemset(SC->xs, 0, nvfp4_scale_buffer_bytes(Mp,K)));
-    nvfp4_quantize_activations(SC->in_pad, SC->xp, SC->xs, Mp, K, ig, 0);
-    uint8_t* Wp = m.wpacked(prefix);
-    uint8_t* Ws = m.wscale(prefix);
-    int rc = nvfp4_gemm(SC->dcol, SC->xp, SC->xs, 1.0f/ig, Wp, Ws, 1.0f/wg, Mp, N, K, m.lt, m.ws, m.wsb, 0);
-    if(rc){ fprintf(stderr,"linear %s rc=%d\n",prefix.c_str(),rc); exit(1);}
-    CU(cudaDeviceSynchronize());
-    k_transpose<<<(M*N+255)/256,256>>>(out_row, SC->dcol, M, N, Mp); // first M rows; ld=Mp
+    uint8_t* Wp = m.dptr<uint8_t*>(prefix+".weight_packed");
+    uint8_t* Ws = m.dptr<uint8_t*>(prefix+".weight_scale");
+    w4a16_gemm(out_row, Wp, Ws, m.scalarF32(prefix+".weight_global_scale"), in_row, M, N, K, 0);
 }
 
 // build rope cos/sin tables [seq, half] on host -> device

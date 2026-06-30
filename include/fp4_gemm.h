@@ -16,6 +16,11 @@ size_t nvfp4_scale_buffer_bytes(int outer, int K);
 // cuBLAS tile layout (host out buffer of size nvfp4_scale_buffer_bytes). OOB padding zeroed.
 void nvfp4_swizzle_scales(const uint8_t* logical, uint8_t* swizzled, int outer, int K);
 
+// Batched W4A16 GEMM: out[M,N] row-major = dequant(W[N,K]) @ x[M,K]^T. FP4 weight x fp32 activation
+// (no activation quant). Raw unswizzled weight+scales, any alignment. Weight reused across M rows.
+void w4a16_gemm(float* out, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
+                int M, int N, int K, cudaStream_t s);
+
 // FP4-weight GEMV for decode (M=1, W4A16). y[N] row-major = dequant(W[N,K]) @ x[K].
 // wp = raw packed weight [N,K/2], ws = raw E4M3 scales [N,K/16] (unswizzled). No activation quant.
 void fp4_gemv(float* y, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
