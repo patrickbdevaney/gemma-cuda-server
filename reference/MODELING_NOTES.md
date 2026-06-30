@@ -327,3 +327,28 @@ proportional partial_rotary per layer-type. No contradictions found.
 NOT FOUND / needs check against checkpoint config.json: exact runtime value of
 `hidden_size_per_layer_input` (PLE on/off) and `num_kv_shared_layers` (assumed 0).
 ```
+
+---
+## RESOLVED via loader gate + direct modeling read (2026-06-30, authoritative)
+
+**weight_packed second dim is PACKED = in_features/2** (2 FP4/byte). So e.g. layer-5 full-attn
+o_proj `[2816,4096]` ⇒ in_features 8192 = 16×512. No qk/v head_dim asymmetry — full-attn uses
+head_dim 512 throughout.
+
+**Per-layer-type attention geometry (verified vs checkpoint shapes):**
+- SLIDING (25 layers, idx not in {5,11,17,23,29}): head_dim 256, 16 q-heads / 8 kv-heads.
+  q_proj[4096,2816] k/v_proj[2048,2816] o_proj[2816,4096]. RoPE default θ1e4, full 256-dim rot. window 1024 causal.
+- FULL (5 layers {5,11,17,23,29}): head_dim 512 (global_head_dim), 16 q / 2 kv heads. use_alternative_attention (k_eq_v).
+  q_proj[8192,2816] k_proj[1024,2816] NO v_proj o_proj[2816,8192]. RoPE proportional θ1e6 partial_rotary 0.25.
+
+**k_eq_v dataflow (full-attn, modeling §1258-1266):** kp = k_proj(x); V = v_norm(kp) [no RoPE, no weight];
+K = RoPE(k_norm(kp)); Q = RoPE(q_norm(q_proj(x))). GQA repeat kv to 16 heads.
+
+**Norms:** Gemma4RMSNorm = x*(mean(x²)+1e-6)^-0.5 *[weight if with_scale], fp32. q_norm/k_norm have weight
+[head_dim]; v_norm with_scale=False (NO weight tensor, still normalizes). Decoder norms (input/post_attn/
+pre_ff/post_ff) all have weight [2816].
+
+**Attention scores:** scaling=1.0 (NO 1/sqrt(d)), softcap=None (NO attn-logit softcap). softmax in fp32.
+Temperature is set entirely by learned q_norm/k_norm weights. THIS IS UNUSUAL — verify in 3.4 logit gate.
+
+**Open for 3.2:** exact 'proportional' RoPE attention_scaling factor on cos/sin (see rope_proportional.txt).
