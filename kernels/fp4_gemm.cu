@@ -2,6 +2,7 @@
 // Recipe per reference/CUBLASLT_FP4_RECIPE.md (cuBLAS 13.3 "1D Block Scaling Factors Layout").
 #include "fp4_gemm.h"
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 #include <cstdio>
 #include <cstring>
 
@@ -38,8 +39,8 @@ void nvfp4_swizzle_scales(const uint8_t* logical, uint8_t* swizzled, int outer, 
 // y[N] = sum_k (fp4(wp[n,k]) * e4m3(ws[n,k/16]) / w_gscale) * x[k].  Raw (unswizzled) weight+scales.
 __device__ __forceinline__ float e2m1_dec(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
 __device__ __forceinline__ float e4m3_dec(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
-// warp-per-output GEMV, FP16 ACTIVATIONS: 8 fp16 activations loaded as ONE uint4 (128-bit) per iter
-// (was 8 fp32 loads). Halves activation bytes + 8x fewer activation load instructions. shfl reduction.
+// PRODUCTION GEMV: HW FP4 decode (cvt.rn.f16x2.e2m1x2, 2 codes->half2) + fp16 acts (uint4 load) + half2 FMA.
+// Replaces scalar table lookups (the memory-pipe instructions). One warp/output, shfl reduce.
 __global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, float wg_inv,
                                 const __half* x, int N, int K){
     __shared__ float lut[256];
@@ -50,10 +51,16 @@ __global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, 
     const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); const uint8_t* wsn=ws+(size_t)n*(K/16);
     float acc=0.f; int nu=K/8;
     for(int vi=lane; vi<nu; vi+=32){
-        unsigned w=wpn[vi]; int k=vi*8; float sc=lut[wsn[k>>4]];
-        uint4 xpk=*(const uint4*)(x+k); const __half* xh=(const __half*)&xpk;  // 8 halves, 128-bit load
+        unsigned w=wpn[vi]; int k=vi*8; float sc=lut[wsn[k>>4]];   // one e4m3 scale per 8 codes
+        uint4 xpk=*(const uint4*)(x+k); const __half2* xh2=(const __half2*)&xpk;  // 4 half2 (8 fp16 acts)
+        const unsigned char* wb=(const unsigned char*)&w;
+        __half2 a2=__float2half2_rn(0.f);
         #pragma unroll
-        for(int q=0;q<8;++q) acc += e2m1_dec((uint8_t)((w>>(q*4))&0xF)) * sc * __half2float(xh[q]);
+        for(int b=0;b<4;++b){
+            __half2_raw wr=__nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)wb[b], __NV_E2M1); // 2 FP4 -> half2
+            a2=__hfma2(*reinterpret_cast<__half2*>(&wr), xh2[b], a2);
+        }
+        acc += sc * (__half2float(__low2half(a2)) + __half2float(__high2half(a2)));
     }
     #pragma unroll
     for(int o=16;o>0;o>>=1) acc += __shfl_down_sync(0xffffffffu, acc, o);
