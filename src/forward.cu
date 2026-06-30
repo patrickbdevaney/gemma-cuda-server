@@ -8,6 +8,7 @@
 #include "attention.h"
 #include "draft.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,6 +100,7 @@ __global__ void k_lmhead_batched(float* out,const float* hn,const uint16_t* emb,
     }
 }
 __global__ void k_scale_const(float* x,float s,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) x[i]*=s; }
+__global__ void k_f32_to_f16(__half* out,const float* in,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) out[i]=__float2half(in[i]); }
 // device argmax over V for each of mtok rows
 __global__ void k_argmax(int* out,const float* lg,int V){
     int p=blockIdx.x; __shared__ float sv[256]; __shared__ int si[256];
@@ -249,6 +251,22 @@ struct Scratch { float* in_pad; uint8_t* xp; uint8_t* xs; float* dcol; size_t ca
         CU(cudaMalloc(&xs, nvfp4_scale_buffer_bytes(cap_rows,cap_k))); CU(cudaMalloc(&dcol, cap_rows*cap_n*4)); } };
 static Scratch* SC;
 
+// pre-allocated decode scratch (no per-step cudaMalloc; cudaMalloc blocks + prevents graph capture)
+static const int MAXM=16, QDMAX=16*512, KDMAX=16*512;
+struct DScratch {
+    float *hmain,*hn,*q,*k,*v,*ao,*op,*dc,*ds;
+    float *resid,*mi,*g,*u,*hs1,*x2,*hbuf,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
+    float *hl,*dlog,*hln,*lg2; int* darg; __half* xh16;
+    DScratch(){ auto A=[&](float*&p,size_t n){ CU(cudaMalloc(&p,n*4)); };
+        CU(cudaMalloc(&xh16,(size_t)QDMAX*sizeof(__half)));  // fp16 activation scratch for GEMV (K up to 8192)
+        A(hl,H);A(dlog,VOCAB);A(hln,MAXM*H);A(lg2,(size_t)MAXM*VOCAB);CU(cudaMalloc(&darg,MAXM*4));
+        A(hmain,MAXM*H);A(hn,MAXM*H);A(q,MAXM*QDMAX);A(k,MAXM*KDMAX);A(v,MAXM*KDMAX);A(ao,MAXM*QDMAX);A(op,MAXM*H);
+        A(dc,MAXM*256);A(ds,MAXM*256);A(resid,MAXM*H);A(mi,MAXM*H);A(g,MAXM*MLP_INT);A(u,MAXM*MLP_INT);A(hs1,MAXM*H);
+        A(x2,MAXM*H);A(hbuf,(size_t)MAXM*8*MOE_INT);A(moe_out,MAXM*H);A(scores,MAXM*128);A(top8_w,MAXM*8);A(sc1,MAXM);
+        CU(cudaMalloc(&top8_ids,MAXM*8*4)); CU(cudaMalloc(&dids,MAXM*4)); }
+};
+static DScratch* DS;
+
 // ---- single-session KV cache (BF16), fixed capacity ----
 static int CAP = 8192;   // context capacity (set via CTX env); 65536 for full 64K target
 struct Session {
@@ -264,7 +282,8 @@ static void linear(Model& m, float* out_row, const float* in_row, const std::str
     uint8_t* Wp = m.dptr<uint8_t*>(prefix+".weight_packed");
     uint8_t* Ws = m.dptr<uint8_t*>(prefix+".weight_scale");
     float wg = m.scalarF32(prefix+".weight_global_scale");
-    if(M==1) fp4_gemv(out_row, Wp, Ws, wg, in_row, N, K, 0);   // streaming GEMV (1KB shared -> high occupancy)
+    if(M==1){ k_f32_to_f16<<<(K+255)/256,256>>>(DS->xh16, in_row, K);   // fp16 activation -> 128-bit loads in GEMV
+        fp4_gemv(out_row, Wp, Ws, wg, DS->xh16, N, K, 0); }
     else     w4a16_gemm(out_row, Wp, Ws, wg, in_row, M, N, K, 0);  // batched (shared-dequant, weight reused over M)
 }
 
@@ -280,20 +299,6 @@ static void rope_tables(int seq,int head_dim,double theta,int rope_angles,float*
     CU(cudaMemcpy(*dsin,s.data(),s.size()*4,cudaMemcpyHostToDevice));
 }
 
-// pre-allocated decode scratch (no per-step cudaMalloc; cudaMalloc blocks + prevents graph capture)
-static const int MAXM=16, QDMAX=16*512, KDMAX=16*512;
-struct DScratch {
-    float *hmain,*hn,*q,*k,*v,*ao,*op,*dc,*ds;
-    float *resid,*mi,*g,*u,*hs1,*x2,*hbuf,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
-    float *hl,*dlog,*hln,*lg2; int* darg;
-    DScratch(){ auto A=[&](float*&p,size_t n){ CU(cudaMalloc(&p,n*4)); };
-        A(hl,H);A(dlog,VOCAB);A(hln,MAXM*H);A(lg2,(size_t)MAXM*VOCAB);CU(cudaMalloc(&darg,MAXM*4));
-        A(hmain,MAXM*H);A(hn,MAXM*H);A(q,MAXM*QDMAX);A(k,MAXM*KDMAX);A(v,MAXM*KDMAX);A(ao,MAXM*QDMAX);A(op,MAXM*H);
-        A(dc,MAXM*256);A(ds,MAXM*256);A(resid,MAXM*H);A(mi,MAXM*H);A(g,MAXM*MLP_INT);A(u,MAXM*MLP_INT);A(hs1,MAXM*H);
-        A(x2,MAXM*H);A(hbuf,(size_t)MAXM*8*MOE_INT);A(moe_out,MAXM*H);A(scores,MAXM*128);A(top8_w,MAXM*8);A(sc1,MAXM);
-        CU(cudaMalloc(&top8_ids,MAXM*8*4)); CU(cudaMalloc(&dids,MAXM*4)); }
-};
-static DScratch* DS;
 // device rope cos/sin tables into pre-allocated dc/ds [mtok, head_dim/2] for absolute positions base..base+mtok
 __global__ void k_rope_tables(float* dc,float* ds,int base,int head_dim,double theta,int rope_angles){
     int p=blockIdx.x,j=threadIdx.x,half=head_dim/2; if(j>=half)return;

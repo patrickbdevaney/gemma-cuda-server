@@ -1,6 +1,7 @@
 // fp4_gemm.cu — NVFP4 block-scaled GEMM via cublasLt (CUDA 13, Blackwell sm_110a).
 // Recipe per reference/CUBLASLT_FP4_RECIPE.md (cuBLAS 13.3 "1D Block Scaling Factors Layout").
 #include "fp4_gemm.h"
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstring>
 
@@ -37,10 +38,11 @@ void nvfp4_swizzle_scales(const uint8_t* logical, uint8_t* swizzled, int outer, 
 // y[N] = sum_k (fp4(wp[n,k]) * e4m3(ws[n,k/16]) / w_gscale) * x[k].  Raw (unswizzled) weight+scales.
 __device__ __forceinline__ float e2m1_dec(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
 __device__ __forceinline__ float e4m3_dec(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
-// warp-per-output GEMV: each warp computes one output via shfl reduction (no block __syncthreads in hot loop)
+// warp-per-output GEMV, FP16 ACTIVATIONS: 8 fp16 activations loaded as ONE uint4 (128-bit) per iter
+// (was 8 fp32 loads). Halves activation bytes + 8x fewer activation load instructions. shfl reduction.
 __global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, float wg_inv,
-                                const float* x, int N, int K){
-    __shared__ float lut[256];  // e4m3 byte -> value*wg_inv
+                                const __half* x, int N, int K){
+    __shared__ float lut[256];
     for(int i=threadIdx.x;i<256;i+=blockDim.x) lut[i]=e4m3_dec((uint8_t)i)*wg_inv;
     __syncthreads();
     int lane=threadIdx.x&31, n=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
@@ -48,17 +50,18 @@ __global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, 
     const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); const uint8_t* wsn=ws+(size_t)n*(K/16);
     float acc=0.f; int nu=K/8;
     for(int vi=lane; vi<nu; vi+=32){
-        unsigned w=wpn[vi]; int k=vi*8; const float* xv=x+k; float sc=lut[wsn[k>>4]];
+        unsigned w=wpn[vi]; int k=vi*8; float sc=lut[wsn[k>>4]];
+        uint4 xpk=*(const uint4*)(x+k); const __half* xh=(const __half*)&xpk;  // 8 halves, 128-bit load
         #pragma unroll
-        for(int q=0;q<8;++q) acc += e2m1_dec((uint8_t)((w>>(q*4))&0xF)) * sc * xv[q];
+        for(int q=0;q<8;++q) acc += e2m1_dec((uint8_t)((w>>(q*4))&0xF)) * sc * __half2float(xh[q]);
     }
     #pragma unroll
     for(int o=16;o>0;o>>=1) acc += __shfl_down_sync(0xffffffffu, acc, o);
     if(lane==0) y[n]=acc;
 }
-void fp4_gemv(float* y, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
+void fp4_gemv(float* y, const uint8_t* wp, const uint8_t* ws, float w_gscale, const void* x16,
               int N, int K, cudaStream_t s){
-    int wpb=8; fp4_gemv_kernel<<<(N+wpb-1)/wpb,wpb*32,0,s>>>(y, wp, ws, 1.0f/w_gscale, x, N, K);  // 8 warps/block
+    int wpb=8; fp4_gemv_kernel<<<(N+wpb-1)/wpb,wpb*32,0,s>>>(y, wp, ws, 1.0f/w_gscale, (const __half*)x16, N, K);
 }
 
 // ---- batched W4A16 GEMM (FP4 weight x fp32 activation, NO activation quant) ----
