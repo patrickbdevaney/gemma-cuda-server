@@ -142,7 +142,7 @@ __global__ void k_router_top8(int* ids,float* ws,const float* scores,const uint1
 // expert gate/up: hbuf[t,j,i] = gelu(Wg_e[i]·x2[t]) * (Wu_e[i]·x2[t]); one block per (t,j,i)
 __global__ void k_moe_gateup(float* hbuf,const float* x2,const int* ids,
     const uint8_t* const* gp,const uint8_t* const* gs,const float* gg,
-    const uint8_t* const* up,const uint8_t* const* us,const float* ug,int H,int MI){
+    const uint8_t* const* up,const uint8_t* const* us,const float* ug,int mtok,int H,int MI){
     long idx=blockIdx.x; int i=idx%MI; long rest=idx/MI; int j=rest%8,t=rest/8; int e=ids[(size_t)t*8+j];
     const float* x=x2+(size_t)t*H;
     __shared__ float lut[256]; for(int z=threadIdx.x;z<256;z+=blockDim.x) lut[z]=e4m3d((uint8_t)z); __syncthreads();
@@ -157,9 +157,10 @@ __global__ void k_moe_gateup(float* hbuf,const float* x2,const int* ids,
     for(int s=128;s>0;s>>=1){ if(threadIdx.x<s){rg[threadIdx.x]+=rg[threadIdx.x+s];ru[threadIdx.x]+=ru[threadIdx.x+s];} __syncthreads(); }
     if(threadIdx.x==0){ float g=rg[0]; float gel=0.5f*g*(1.f+tanhf(0.7978845608f*(g+0.044715f*g*g*g))); hbuf[idx]=gel*ru[0]; }
 }
-// expert down + weighted sum: out[t,d] = sum_j ws[t,j] * (Wd_e[d]·hbuf[t,j]); one block per (t,d)
+// expert down: out[t,d] += ws[t,j]*(Wd_e[d]·hbuf[t,j]); warp per (t,j,d), atomicAdd (parallel over experts).
+// out must be pre-zeroed. mtok*8*H warp-outputs.
 __global__ void k_moe_down(float* out,const float* hbuf,const int* ids,const float* ws,
-    const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int H,int MI){
+    const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int mtok,int H,int MI){
     long idx=blockIdx.x; int d=idx%H,t=idx/H;
     __shared__ float lut[256]; for(int z=threadIdx.x;z<256;z+=blockDim.x) lut[z]=e4m3d((uint8_t)z); __syncthreads();
     __shared__ float red[256]; float acc=0; int nu=MI/8;
@@ -366,8 +367,8 @@ static void moe(Model& m, float* h, int seq, int L){
     k_router_top8<<<seq,1>>>(top8_ids, top8_w, scores, m.dptr<const uint16_t*>(P+"router.per_expert_scale"), NEXP, TOPK);
     rmsnorm(x2,resid,m.dptr<const uint16_t*>(P+"pre_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     ExpertPtrs* ep=m.experts(L);
-    k_moe_gateup<<<(unsigned)(seq*TOPK*MOE_INT),256>>>(hbuf, x2, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, H, MOE_INT);
-    k_moe_down<<<(unsigned)(seq*H),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, H, MOE_INT);
+    k_moe_gateup<<<(unsigned)(seq*TOPK*MOE_INT),256>>>(hbuf, x2, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
+    k_moe_down<<<(unsigned)(seq*H),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
     rmsnorm(moe_out,moe_out,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     add_inplace(hs1, moe_out, seq*H, 0);
     rmsnorm(hs1, hs1, m.dptr<const uint16_t*>(P+"post_feedforward_layernorm.weight"), seq, H, EPS, 0);
