@@ -42,8 +42,8 @@ __global__ void k_scatter_add(float* out,const float* in,const int* idx,const fl
 // lm_head for the LAST token: logits[v]=softcap(sum_h hlast[h]*bf16(emb[v,h])); one block per vocab
 __global__ void k_lmhead(float* logits,const float* hlast,const uint16_t* emb,int H,int V,float cap){
     int v=blockIdx.x; if(v>=V)return; __shared__ float red[256];
-    const uint16_t* ev=emb+(size_t)v*H; float acc=0;  // uint2 = 4 bf16/load (row offset 8B-aligned)
-    for(int h=threadIdx.x*4; h<H; h+=blockDim.x*4){ uint2 w=*(const uint2*)(ev+h); const uint16_t* b=(const uint16_t*)&w;
+    const uint16_t* ev=emb+(size_t)v*H; float acc=0;  // uint2 = 4 bf16/load (8B-aligned; embed not 16B-aligned), streaming
+    for(int h=threadIdx.x*4; h<H; h+=blockDim.x*4){ uint2 w=__ldcs((const uint2*)(ev+h)); const uint16_t* b=(const uint16_t*)&w;
         acc += hlast[h]*bf2f(b[0])+hlast[h+1]*bf2f(b[1])+hlast[h+2]*bf2f(b[2])+hlast[h+3]*bf2f(b[3]); }
     red[threadIdx.x]=acc; __syncthreads();
     for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
