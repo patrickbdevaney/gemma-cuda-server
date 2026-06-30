@@ -228,7 +228,13 @@ static void moe(Model& m, float* h, int seq, int L){
     cudaFree(resid);cudaFree(mi);cudaFree(g);cudaFree(u);cudaFree(hs1);cudaFree(x2);cudaFree(moe_out);cudaFree(Xe);cudaFree(didx);cudaFree(dw);
 }
 
+static bool DUMP=false;
+static void dump_h(float* h,int seq,int idx){
+    if(!DUMP)return; std::vector<float> hh((size_t)seq*H); CU(cudaMemcpy(hh.data(),h,(size_t)seq*H*4,cudaMemcpyDeviceToHost));
+    char p[128]; snprintf(p,128,"/tmp/cudahs/hs_%d.bin",idx); FILE* f=fopen(p,"wb"); fwrite(hh.data(),4,hh.size(),f); fclose(f);
+}
 int main(int argc,char**argv){
+    if(getenv("DUMP")) DUMP=true; system("mkdir -p /tmp/cudahs");
     std::string ckpt = argc>1?argv[1]:std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-it-NVFP4/model.safetensors";
     std::string tokfile = argc>2?argv[2]:"/tmp/tokens.txt";
     Model m(ckpt); SC=new Scratch();
@@ -239,7 +245,8 @@ int main(int argc,char**argv){
     float* h; CU(cudaMalloc(&h,(size_t)seq*H*4));
     k_embed<<<seq,256>>>(h, m.dptr<const uint16_t*>("model.language_model.embed_tokens.weight"), dids, seq, H, EMB_SCALE);
     CU(cudaDeviceSynchronize());
-    for(int L=0; L<NLAYER; ++L){ attention(m, h, seq, L); moe(m, h, seq, L); }
+    dump_h(h, seq, 0);
+    for(int L=0; L<NLAYER; ++L){ attention(m, h, seq, L); moe(m, h, seq, L); dump_h(h, seq, L+1); }
     // final norm on last token + lm_head (tied embeddings) + softcap
     float* hl; CU(cudaMalloc(&hl,H*4));
     rmsnorm(hl, h+(size_t)(seq-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"), 1, H, EPS, 0);

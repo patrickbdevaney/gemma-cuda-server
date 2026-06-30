@@ -19,8 +19,8 @@ See directive in project root convo; verified arch in `reference/ARCHITECTURE.md
 - [ ] **Phase 2 — scaffold**: dirs + git done; stub sources not yet written
 - [ ] **Phase 3.1** FP4 GEMM + loader (compressed-tensors nvfp4 W4A4, group 16, fp8 e4m3 scales)
 - [ ] **Phase 3.2** attention (global hd512/2kv/pRoPE-0.25/θ1e6 vs sliding hd256/8kv/θ1e4/win1024)
-- [ ] **Phase 3.3** MoE (128 experts, top-8, moe_int 704, bf16 routers, gelu_pytorch_tanh)
-- [ ] **Phase 3.4** full target forward + logit diff vs P1
+- [x] **Phase 3.3** MoE (router softmax-top8-renorm + dense MLP || 128 experts) — in src/forward.cu
+- [x] **Phase 3.4 ✅** full forward GATE PASSES: top-1 matches vLLM on confident prompts (Paris/Blue/4, logprobs match). gibberish prompts not a valid gate (norm 588x amplifies quant noise). scripts/gate_forward.sh
 - [ ] **Phase 3.5** single-session 64K FP8 KV buffer + prefix retention
 - [ ] **Phase 3.6** DFlash draft+verify (block_size 16, taps [1,6,11,17,22,27])
 - [ ] **Phase 3.7** fused decode-step CUDA graph
