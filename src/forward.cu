@@ -291,7 +291,7 @@ struct DScratch {
     float *resid,*mi,*g,*u,*hs1,*x2,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
     float *hl,*dlog,*hln,*lg2; int* darg; __half *xh16,*hbuf,*x2_16;
     DScratch(){ auto A=[&](float*&p,size_t n){ CU(cudaMalloc(&p,n*4)); };
-        CU(cudaMalloc(&xh16,(size_t)QDMAX*sizeof(__half)));  // fp16 activation scratch for GEMV (K up to 8192)
+        CU(cudaMalloc(&xh16,(size_t)MAXM*8192*sizeof(__half)));  // fp16 activation scratch: M=1 GEMV[K] or M<=16 GEMM[M,K]
         CU(cudaMalloc(&hbuf,(size_t)MAXM*8*MOE_INT*sizeof(__half))); CU(cudaMalloc(&x2_16,(size_t)MAXM*H*sizeof(__half)));
         A(hl,H);A(dlog,VOCAB);A(hln,MAXM*H);A(lg2,(size_t)MAXM*VOCAB);CU(cudaMalloc(&darg,MAXM*4));
         A(hmain,MAXM*H);A(hn,MAXM*H);A(q,MAXM*QDMAX);A(k,MAXM*KDMAX);A(v,MAXM*KDMAX);A(ao,MAXM*QDMAX);A(op,MAXM*H);
@@ -318,7 +318,13 @@ static void linear(Model& m, float* out_row, const float* in_row, const std::str
     float wg = m.scalarF32(prefix+".weight_global_scale");
     if(M==1){ k_f32_to_f16<<<(K+255)/256,256>>>(DS->xh16, in_row, K);   // fp16 activation -> 128-bit loads in GEMV
         fp4_gemv(out_row, Wp, Ws, wg, DS->xh16, N, K, 0); }
-    else     w4a16_gemm(out_row, Wp, Ws, wg, in_row, M, N, K, 0);  // batched (shared-dequant, weight reused over M)
+    else {   // batched W4A16: HW-decode weight once, reuse across M tokens via half2 (fp16 acts)
+        __half* x16; bool bigx = M>MAXM;
+        if(bigx) CU(cudaMalloc(&x16,(size_t)M*K*sizeof(__half))); else x16=DS->xh16;
+        k_f32_to_f16<<<((size_t)M*K+255)/256,256>>>(x16, in_row, (size_t)M*K);
+        w4a16_gemm(out_row, Wp, Ws, wg, x16, M, N, K, 0);
+        if(bigx){ CU(cudaStreamSynchronize(0)); CU(cudaFree(x16)); }
+    }
 }
 
 // build rope cos/sin tables [seq, half] on host -> device

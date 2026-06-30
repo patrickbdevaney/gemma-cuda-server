@@ -18,7 +18,7 @@ void nvfp4_swizzle_scales(const uint8_t* logical, uint8_t* swizzled, int outer, 
 
 // Batched W4A16 GEMM: out[M,N] row-major = dequant(W[N,K]) @ x[M,K]^T. FP4 weight x fp32 activation
 // (no activation quant). Raw unswizzled weight+scales, any alignment. Weight reused across M rows.
-void w4a16_gemm(float* out, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
+void w4a16_gemm(float* out, const uint8_t* wp, const uint8_t* ws, float w_gscale, const void* x16,
                 int M, int N, int K, cudaStream_t s);
 
 // FP4-weight GEMV for decode (M=1, W4A16). y[N] = dequant(W[N,K]) @ x[K]. x16 = FP16 activation [K]
