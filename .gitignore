@@ -1,6 +1,6 @@
-*.log
 build/
+*.log
 *.o
-*.so
 __pycache__/
 *.safetensors
+*.so
