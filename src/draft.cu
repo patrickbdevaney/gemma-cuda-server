@@ -34,11 +34,17 @@ __device__ __forceinline__ float bf2f(uint16_t h){ unsigned u=(unsigned)h<<16; f
 
 // ---------------- kernels ----------------
 // out[M,N] = x[M,K] @ W_bf16[N,K]^T   (one thread per output element, loop over K)
+// warp-per-output: out[m,n]=dot(x[m],W[n]) over K, uint2 bf16 loads (4/load) + shfl reduce
 __global__ void k_linear_bf16(float* out,const float* x,const uint16_t* W,int M,int N,int K){
-    int n=blockIdx.x*blockDim.x+threadIdx.x; int m=blockIdx.y; if(n>=N||m>=M)return;
-    const float* xr=x+(size_t)m*K; const uint16_t* wr=W+(size_t)n*K;
-    float acc=0.f; for(int k=0;k<K;++k) acc+=xr[k]*bf2f(wr[k]);
-    out[(size_t)m*N+n]=acc;
+    int lane=threadIdx.x&31; long o=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+    if(o>=(long)M*N) return; int n=o%N,m=o/N;
+    const float* xr=x+(size_t)m*K; const uint2* wv=(const uint2*)(W+(size_t)n*K);
+    float acc=0.f; int nv=K/4;
+    for(int vi=lane; vi<nv; vi+=32){ uint2 ww=wv[vi]; const uint16_t* b=(const uint16_t*)&ww; const float* xv=xr+vi*4;
+        acc += xv[0]*bf2f(b[0])+xv[1]*bf2f(b[1])+xv[2]*bf2f(b[2])+xv[3]*bf2f(b[3]); }
+    #pragma unroll
+    for(int s=16;s>0;s>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,s);
+    if(lane==0) out[o]=acc;
 }
 // RMSNorm: out = x*rsqrt(mean(x^2)+eps) [* bf16 weight if w!=null]. One block per row over `dim`.
 __global__ void k_rmsnorm(float* out,const float* x,const uint16_t* w,int dim,float eps){
@@ -117,7 +123,7 @@ void draft_free(DraftModel* d){ if(d){ delete d->st; delete d; } }
 // ---- helpers ----
 static void linbf(DraftModel* d,float* out,const float* x,const std::string& wname,int M,int N,int K){
     const uint16_t* W=d->dptr<const uint16_t*>(wname);
-    dim3 grid((N+255)/256, M); k_linear_bf16<<<grid,256>>>(out,x,W,M,N,K);
+    k_linear_bf16<<<(unsigned)(((long)M*N+7)/8),256>>>(out,x,W,M,N,K);
 }
 static void rmsn(DraftModel* d,float* out,const float* x,const std::string& wname,int rows,int dim){
     const uint16_t* w = wname.empty()? nullptr : d->dptr<const uint16_t*>(wname);
@@ -228,7 +234,7 @@ void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int
     // ---- (C) logits for the 15 MASK positions (query slots 1..15) -> argmax ----
     float* hmask = hfin + (size_t)1*H;   // rows 1..15
     float* logits; CU(cudaMalloc(&logits,(size_t)NDRAFT*VOCAB*4));
-    { dim3 grid((VOCAB+255)/256, NDRAFT); k_linear_bf16<<<grid,256>>>(logits,hmask,lmhead_bf16,NDRAFT,VOCAB,H); }
+    { k_linear_bf16<<<(unsigned)(((long)NDRAFT*VOCAB+7)/8),256>>>(logits,hmask,lmhead_bf16,NDRAFT,VOCAB,H); }
     CU(cudaDeviceSynchronize());
     std::vector<float> hl((size_t)NDRAFT*VOCAB);
     CU(cudaMemcpy(hl.data(),logits,(size_t)NDRAFT*VOCAB*4,cudaMemcpyDeviceToHost));
