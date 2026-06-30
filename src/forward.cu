@@ -188,25 +188,29 @@ __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
 // 8 experts FUSED into one accumulator -> ONE shfl reduce (vs 8 block reductions + 34% thread util before).
 __global__ void k_moe_down(float* out,const __half* hbuf,const int* ids,const float* ws,
     const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int mtok,int H,int MI){
-    int lane=threadIdx.x&31; long idx=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
-    if(idx>=(long)mtok*H) return; int d=idx%H,t=idx/H;
+    int lane=threadIdx.x&31; long pidx=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);  // RB=2: warp does d0,d0+1
+    if(pidx>=(long)mtok*(H/2)) return; int dp_=pidx%(H/2),t=pidx/(H/2); int d0=dp_*2;
     int E[8]; float WI[8];   // hoist ints/floats only (avoid the 32-pointer register pressure that regressed)
     #pragma unroll
     for(int j=0;j<8;++j){ E[j]=ids[(size_t)t*8+j]; WI[j]=ws[(size_t)t*8+j]/dg[E[j]]; }
-    float acc=0; int nu=MI/8;
+    float acc0=0,acc1=0; int nu=MI/8;
     for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
         #pragma unroll
         for(int j=0;j<8;++j){ int e=E[j];
-            const unsigned* dpw=(const unsigned*)(dp[e]+(size_t)d*(MI/2)); const uint8_t* dsw=ds[e]+(size_t)d*(MI/16);
-            unsigned wd=__ldcs(&dpw[vi]); float sc=C_LUT[__ldcs(&dsw[k>>4])]*WI[j];
-            uint4 hpk=*(const uint4*)(hbuf+((size_t)t*8+j)*MI+k); const __half2* hh2=(const __half2*)&hpk;
-            const unsigned char* wdb=(const unsigned char*)&wd; __half2 s2=__float2half2_rn(0.f);
+            uint4 hpk=*(const uint4*)(hbuf+((size_t)t*8+j)*MI+k); const __half2* hh2=(const __half2*)&hpk;  // shared by d0,d1
+            const unsigned* dpw0=(const unsigned*)(dp[e]+(size_t)d0*(MI/2)); const uint8_t* dsw0=ds[e]+(size_t)d0*(MI/16);
+            const unsigned* dpw1=(const unsigned*)(dp[e]+(size_t)(d0+1)*(MI/2)); const uint8_t* dsw1=ds[e]+(size_t)(d0+1)*(MI/16);
+            unsigned wd0=__ldcs(&dpw0[vi]); float sc0=C_LUT[__ldcs(&dsw0[k>>4])]*WI[j];
+            unsigned wd1=__ldcs(&dpw1[vi]); float sc1=C_LUT[__ldcs(&dsw1[k>>4])]*WI[j];
+            const unsigned char* w0=(const unsigned char*)&wd0; const unsigned char* w1=(const unsigned char*)&wd1;
+            __half2 s20=__float2half2_rn(0.f),s21=__float2half2_rn(0.f);
             #pragma unroll
-            for(int b=0;b<4;++b) s2=__hfma2(dec_fp4x2(wdb[b]),hh2[b],s2);
-            acc += sc*(__half2float(__low2half(s2))+__half2float(__high2half(s2))); } }
+            for(int b=0;b<4;++b){ s20=__hfma2(dec_fp4x2(w0[b]),hh2[b],s20); s21=__hfma2(dec_fp4x2(w1[b]),hh2[b],s21); }
+            acc0 += sc0*(__half2float(__low2half(s20))+__half2float(__high2half(s20)));
+            acc1 += sc1*(__half2float(__low2half(s21))+__half2float(__high2half(s21))); } }
     #pragma unroll
-    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,o);
-    if(lane==0) out[(size_t)t*H+d]=acc;
+    for(int o=16;o>0;o>>=1){ acc0+=__shfl_down_sync(0xffffffffu,acc0,o); acc1+=__shfl_down_sync(0xffffffffu,acc1,o); }
+    if(lane==0){ out[(size_t)t*H+d0]=acc0; out[(size_t)t*H+d0+1]=acc1; }
 }
 
 // device pointer arrays for one layer's 128 experts (indexable by device top-8 id)
@@ -408,7 +412,7 @@ static void moe(Model& m, float* h, int seq, int L){
     k_f32_to_f16<<<(seq*H+255)/256,256>>>(x2_16, x2, seq*H);  // fp16 MoE activation for HW-decode gateup
     ExpertPtrs* ep=m.experts(L);
     k_moe_gateup<<<(unsigned)((seq*TOPK*MOE_INT+7)/8),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
-    k_moe_down<<<(unsigned)((seq*H+7)/8),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
+    k_moe_down<<<(unsigned)((seq*(H/2)+7)/8),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
     rmsnorm(moe_out,moe_out,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     add_inplace(hs1, moe_out, seq*H, 0);
     rmsnorm(hs1, hs1, m.dptr<const uint16_t*>(P+"post_feedforward_layernorm.weight"), seq, H, EPS, 0);
