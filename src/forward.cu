@@ -137,12 +137,14 @@ __global__ void k_moe_gateup(float* hbuf,const float* x2,const int* ids,
     const uint8_t* const* up,const uint8_t* const* us,const float* ug,int H,int MI){
     long idx=blockIdx.x; int i=idx%MI; long rest=idx/MI; int j=rest%8,t=rest/8; int e=ids[(size_t)t*8+j];
     const float* x=x2+(size_t)t*H;
-    const uint8_t* gpw=gp[e]+(size_t)i*(H/2); const uint8_t* gsw=gs[e]+(size_t)i*(H/16); float ginv=1.f/gg[e];
-    const uint8_t* upw=up[e]+(size_t)i*(H/2); const uint8_t* usw=us[e]+(size_t)i*(H/16); float uinv=1.f/ug[e];
-    __shared__ float rg[256],ru[256]; float ag=0,au=0;
-    for(int k=threadIdx.x;k<H;k+=blockDim.x){
-        uint8_t gb=gpw[k>>1],gc=(k&1)?(gb>>4):(gb&0xF); ag+=e2m1d(gc)*(e4m3d(gsw[k>>4])*ginv)*x[k];
-        uint8_t ub=upw[k>>1],uc=(k&1)?(ub>>4):(ub&0xF); au+=e2m1d(uc)*(e4m3d(usw[k>>4])*uinv)*x[k]; }
+    __shared__ float lut[256]; for(int z=threadIdx.x;z<256;z+=blockDim.x) lut[z]=e4m3d((uint8_t)z); __syncthreads();
+    const unsigned* gpw=(const unsigned*)(gp[e]+(size_t)i*(H/2)); const uint8_t* gsw=gs[e]+(size_t)i*(H/16); float ginv=1.f/gg[e];
+    const unsigned* upw=(const unsigned*)(up[e]+(size_t)i*(H/2)); const uint8_t* usw=us[e]+(size_t)i*(H/16); float uinv=1.f/ug[e];
+    __shared__ float rg[256],ru[256]; float ag=0,au=0; int nu=H/8;
+    for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; const float* xv=x+k;
+        unsigned wg=gpw[vi]; float sg=lut[gsw[k>>4]]*ginv; unsigned wu=upw[vi]; float su=lut[usw[k>>4]]*uinv;
+        #pragma unroll
+        for(int q=0;q<8;++q){ float xq=xv[q]; ag+=e2m1d((uint8_t)((wg>>(q*4))&0xF))*sg*xq; au+=e2m1d((uint8_t)((wu>>(q*4))&0xF))*su*xq; } }
     rg[threadIdx.x]=ag; ru[threadIdx.x]=au; __syncthreads();
     for(int s=128;s>0;s>>=1){ if(threadIdx.x<s){rg[threadIdx.x]+=rg[threadIdx.x+s];ru[threadIdx.x]+=ru[threadIdx.x+s];} __syncthreads(); }
     if(threadIdx.x==0){ float g=rg[0]; float gel=0.5f*g*(1.f+tanhf(0.7978845608f*(g+0.044715f*g*g*g))); hbuf[idx]=gel*ru[0]; }
@@ -150,11 +152,15 @@ __global__ void k_moe_gateup(float* hbuf,const float* x2,const int* ids,
 // expert down + weighted sum: out[t,d] = sum_j ws[t,j] * (Wd_e[d]·hbuf[t,j]); one block per (t,d)
 __global__ void k_moe_down(float* out,const float* hbuf,const int* ids,const float* ws,
     const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int H,int MI){
-    long idx=blockIdx.x; int d=idx%H,t=idx/H; __shared__ float red[256]; float acc=0;
+    long idx=blockIdx.x; int d=idx%H,t=idx/H;
+    __shared__ float lut[256]; for(int z=threadIdx.x;z<256;z+=blockDim.x) lut[z]=e4m3d((uint8_t)z); __syncthreads();
+    __shared__ float red[256]; float acc=0; int nu=MI/8;
     for(int j=0;j<8;++j){ int e=ids[(size_t)t*8+j]; float w=ws[(size_t)t*8+j];
-        const uint8_t* dpw=dp[e]+(size_t)d*(MI/2); const uint8_t* dsw=ds[e]+(size_t)d*(MI/16); float dinv=1.f/dg[e];
+        const unsigned* dpw=(const unsigned*)(dp[e]+(size_t)d*(MI/2)); const uint8_t* dsw=ds[e]+(size_t)d*(MI/16); float dinv=1.f/dg[e];
         const float* hh=hbuf+((size_t)t*8+j)*MI; float s=0;
-        for(int i=threadIdx.x;i<MI;i+=blockDim.x){ uint8_t b=dpw[i>>1],c=(i&1)?(b>>4):(b&0xF); s+=e2m1d(c)*(e4m3d(dsw[i>>4])*dinv)*hh[i]; }
+        for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; unsigned wd=dpw[vi]; float sc=lut[dsw[k>>4]]*dinv; const float* hv=hh+k;
+            #pragma unroll
+            for(int q=0;q<8;++q) s+=e2m1d((uint8_t)((wd>>(q*4))&0xF))*sc*hv[q]; }
         red[threadIdx.x]=s; __syncthreads();
         for(int sf=128;sf>0;sf>>=1){ if(threadIdx.x<sf)red[threadIdx.x]+=red[threadIdx.x+sf]; __syncthreads(); }
         if(threadIdx.x==0) acc+=w*red[0]; __syncthreads(); }

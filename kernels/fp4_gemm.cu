@@ -40,14 +40,19 @@ __device__ __forceinline__ float e4m3_dec(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0x
 __global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, float wg_inv,
                                 const float* x, int N, int K){
     int n=blockIdx.x; if(n>=N) return;
-    const uint8_t* wpn=wp+(size_t)n*(K/2); const uint8_t* wsn=ws+(size_t)n*(K/16);
-    __shared__ float red[256]; float acc=0.f;
-    for(int k=threadIdx.x;k<K;k+=blockDim.x){
-        uint8_t byte=wpn[k>>1]; uint8_t code=(k&1)?(byte>>4):(byte&0xF);
-        acc += e2m1_dec(code) * (e4m3_dec(wsn[k>>4])*wg_inv) * x[k];
+    __shared__ float lut[256];  // e4m3 byte -> value*wg_inv (no ldexpf in inner loop)
+    for(int i=threadIdx.x;i<256;i+=blockDim.x) lut[i]=e4m3_dec((uint8_t)i)*wg_inv;
+    __syncthreads();
+    const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); // 4-byte aligned (offset%4==0); 8 codes/load
+    const uint8_t* wsn=ws+(size_t)n*(K/16);
+    __shared__ float red[256]; float acc=0.f; int nu=K/8;
+    for(int vi=threadIdx.x; vi<nu; vi+=blockDim.x){
+        unsigned w=wpn[vi]; int k=vi*8; const float* xv=x+k; float sc=lut[wsn[k>>4]];
+        #pragma unroll
+        for(int q=0;q<8;++q) acc += e2m1_dec((uint8_t)((w>>(q*4))&0xF)) * sc * xv[q];
     }
     red[threadIdx.x]=acc; __syncthreads();
-    for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
     if(threadIdx.x==0) y[n]=red[0];
 }
 void fp4_gemv(float* y, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
