@@ -64,29 +64,29 @@ void fp4_gemv(float* y, const uint8_t* wp, const uint8_t* ws, float w_gscale, co
 // ---- batched W4A16 GEMM (FP4 weight x fp32 activation, NO activation quant) ----
 // out[M,N] row-major = dequant(W[N,K]) @ x[M,K]^T. Weight row n read ONCE (shared), reused over all M.
 // Accurate (no act-quant), any M, any alignment (byte loads), unswizzled raw scales. Self-consistent w/ fp4_gemv.
+// warp-per-output-column: each warp reads weight row n ONCE (vectorized uint32 + LUT), accumulates
+// M dots with the M activation rows. No big shared (high occupancy). M<=16.
 __global__ void w4a16_gemm_kernel(float* out, const uint8_t* wp, const uint8_t* ws, float wg_inv,
                                   const float* x, int M, int N, int K){
-    int n=blockIdx.x; if(n>=N) return;
-    extern __shared__ float sm[]; float* sW=sm; float* red=sm+K;
-    const uint8_t* wpn=wp+(size_t)n*(K/2); const uint8_t* wsn=ws+(size_t)n*(K/16);
-    for(int k=threadIdx.x;k<K;k+=blockDim.x){
-        uint8_t byte=wpn[k>>1]; uint8_t code=(k&1)?(byte>>4):(byte&0xF);
-        sW[k]=e2m1_dec(code)*(e4m3_dec(wsn[k>>4])*wg_inv);
-    }
+    __shared__ float lut[256]; for(int i=threadIdx.x;i<256;i+=blockDim.x) lut[i]=e4m3_dec((uint8_t)i)*wg_inv;
     __syncthreads();
+    int lane=threadIdx.x&31, n=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5); if(n>=N) return;
+    const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); const uint8_t* wsn=ws+(size_t)n*(K/16);
+    float acc[16]; for(int m=0;m<M;++m) acc[m]=0.f;
+    int nu=K/8;
+    for(int vi=lane; vi<nu; vi+=32){ unsigned w=wpn[vi]; int k=vi*8; float sc=lut[wsn[k>>4]];
+        #pragma unroll
+        for(int q=0;q<8;++q){ float wv=e2m1_dec((uint8_t)((w>>(q*4))&0xF))*sc;
+            for(int m=0;m<M;++m) acc[m]+=wv*x[(size_t)m*K+k+q]; } }
     for(int m=0;m<M;++m){
-        const float* xm=x+(size_t)m*K; float acc=0.f;
-        for(int k=threadIdx.x;k<K;k+=blockDim.x) acc+=sW[k]*xm[k];
-        red[threadIdx.x]=acc; __syncthreads();
-        for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
-        if(threadIdx.x==0) out[(size_t)m*N+n]=red[0];
-        __syncthreads();
+        #pragma unroll
+        for(int o=16;o>0;o>>=1) acc[m]+=__shfl_down_sync(0xffffffffu,acc[m],o);
+        if(lane==0) out[(size_t)m*N+n]=acc[m];
     }
 }
 void w4a16_gemm(float* out, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
                 int M, int N, int K, cudaStream_t s){
-    size_t shmem=((size_t)K+256)*4;
-    w4a16_gemm_kernel<<<N,256,shmem,s>>>(out, wp, ws, 1.0f/w_gscale, x, M, N, K);
+    int wpb=8; w4a16_gemm_kernel<<<(N+wpb-1)/wpb,wpb*32,0,s>>>(out, wp, ws, 1.0f/w_gscale, x, M, N, K);
 }
 
 int nvfp4_gemm(float* dD,
