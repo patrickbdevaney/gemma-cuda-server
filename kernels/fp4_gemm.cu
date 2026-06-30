@@ -37,27 +37,28 @@ void nvfp4_swizzle_scales(const uint8_t* logical, uint8_t* swizzled, int outer, 
 // y[N] = sum_k (fp4(wp[n,k]) * e4m3(ws[n,k/16]) / w_gscale) * x[k].  Raw (unswizzled) weight+scales.
 __device__ __forceinline__ float e2m1_dec(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
 __device__ __forceinline__ float e4m3_dec(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
+// warp-per-output GEMV: each warp computes one output via shfl reduction (no block __syncthreads in hot loop)
 __global__ void fp4_gemv_kernel(float* y, const uint8_t* wp, const uint8_t* ws, float wg_inv,
                                 const float* x, int N, int K){
-    int n=blockIdx.x; if(n>=N) return;
-    __shared__ float lut[256];  // e4m3 byte -> value*wg_inv (no ldexpf in inner loop)
+    __shared__ float lut[256];  // e4m3 byte -> value*wg_inv
     for(int i=threadIdx.x;i<256;i+=blockDim.x) lut[i]=e4m3_dec((uint8_t)i)*wg_inv;
     __syncthreads();
-    const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); // 4-byte aligned (offset%4==0); 8 codes/load
-    const uint8_t* wsn=ws+(size_t)n*(K/16);
-    __shared__ float red[256]; float acc=0.f; int nu=K/8;
-    for(int vi=threadIdx.x; vi<nu; vi+=blockDim.x){
+    int lane=threadIdx.x&31, n=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+    if(n>=N) return;
+    const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); const uint8_t* wsn=ws+(size_t)n*(K/16);
+    float acc=0.f; int nu=K/8;
+    for(int vi=lane; vi<nu; vi+=32){
         unsigned w=wpn[vi]; int k=vi*8; const float* xv=x+k; float sc=lut[wsn[k>>4]];
         #pragma unroll
         for(int q=0;q<8;++q) acc += e2m1_dec((uint8_t)((w>>(q*4))&0xF)) * sc * xv[q];
     }
-    red[threadIdx.x]=acc; __syncthreads();
-    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
-    if(threadIdx.x==0) y[n]=red[0];
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if(lane==0) y[n]=acc;
 }
 void fp4_gemv(float* y, const uint8_t* wp, const uint8_t* ws, float w_gscale, const float* x,
               int N, int K, cudaStream_t s){
-    fp4_gemv_kernel<<<N,256,0,s>>>(y, wp, ws, 1.0f/w_gscale, x, N, K);
+    int wpb=8; fp4_gemv_kernel<<<(N+wpb-1)/wpb,wpb*32,0,s>>>(y, wp, ws, 1.0f/w_gscale, x, N, K);  // 8 warps/block
 }
 
 // ---- batched W4A16 GEMM (FP4 weight x fp32 activation, NO activation quant) ----

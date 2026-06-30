@@ -40,7 +40,9 @@ __global__ void k_scatter_add(float* out,const float* in,const int* idx,const fl
 // lm_head for the LAST token: logits[v]=softcap(sum_h hlast[h]*bf16(emb[v,h])); one block per vocab
 __global__ void k_lmhead(float* logits,const float* hlast,const uint16_t* emb,int H,int V,float cap){
     int v=blockIdx.x; if(v>=V)return; __shared__ float red[256];
-    float acc=0; for(int h=threadIdx.x;h<H;h+=blockDim.x) acc+=hlast[h]*bf2f(emb[(size_t)v*H+h]);
+    const uint16_t* ev=emb+(size_t)v*H; float acc=0;  // uint2 = 4 bf16/load (row offset 8B-aligned)
+    for(int h=threadIdx.x*4; h<H; h+=blockDim.x*4){ uint2 w=*(const uint2*)(ev+h); const uint16_t* b=(const uint16_t*)&w;
+        acc += hlast[h]*bf2f(b[0])+hlast[h+1]*bf2f(b[1])+hlast[h+2]*bf2f(b[2])+hlast[h+3]*bf2f(b[3]); }
     red[threadIdx.x]=acc; __syncthreads();
     for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
     if(threadIdx.x==0){ float x=red[0]; logits[v]=cap*tanhf(x/cap); } }
@@ -85,9 +87,12 @@ __global__ void sdpa_cache_kernel(float* out, const float* Q, const uint16_t* Kc
 
 // batched lm_head over mtok positions: logits[mtok,V]; each block loads one embed row, reused across positions
 __global__ void k_lmhead_batched(float* out,const float* hn,const uint16_t* emb,int H,int V,int mtok){
-    int v=blockIdx.x; if(v>=V)return; __shared__ float red[256];
+    int v=blockIdx.x; if(v>=V)return; extern __shared__ float se[]; __shared__ float red[256];
+    const uint16_t* ev=emb+(size_t)v*H;
+    for(int h=threadIdx.x;h<H;h+=256) se[h]=bf2f(ev[h]);  // embed row once, reused across all mtok positions
+    __syncthreads();
     for(int p=0;p<mtok;++p){
-        float acc=0; for(int h=threadIdx.x;h<H;h+=256) acc+=hn[(size_t)p*H+h]*bf2f(emb[(size_t)v*H+h]);
+        const float* hp=hn+(size_t)p*H; float acc=0; for(int h=threadIdx.x;h<H;h+=256) acc+=hp[h]*se[h];
         red[threadIdx.x]=acc; __syncthreads();
         for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
         if(threadIdx.x==0) out[(size_t)p*V+v]=red[0]; __syncthreads();
@@ -405,7 +410,7 @@ int main(int argc,char**argv){
             fprintf(stderr,"[prof] layers=%.1fms head=%.1fms (cum layers=%.0f head=%.0f)\n",ab,bc,t_layers,t_head);}
         if(allarg){ allarg->resize(mtok);  // batched: norm all positions -> one batched lm_head -> device argmax
             rmsnorm(DS->hln,h,m.dptr<const uint16_t*>("model.language_model.norm.weight"),mtok,H,EPS,0);
-            k_lmhead_batched<<<VOCAB,256>>>(DS->lg2,DS->hln,m.dptr<const uint16_t*>(embn),H,VOCAB,mtok);
+            k_lmhead_batched<<<VOCAB,256,(size_t)H*4>>>(DS->lg2,DS->hln,m.dptr<const uint16_t*>(embn),H,VOCAB,mtok);
             k_argmax<<<mtok,256>>>(DS->darg,DS->lg2,VOCAB); CU(cudaDeviceSynchronize());
             CU(cudaMemcpy(allarg->data(),DS->darg,mtok*4,cudaMemcpyDeviceToHost)); }
         if(big){ cudaFree(dids);cudaFree(h); }
