@@ -61,10 +61,13 @@ public:
         uint64_t hlen; memcpy(&hlen, base_, 8);
         const char* hdr = (const char*)base_ + 8;
         const uint8_t* data_start = base_ + 8 + hlen;
+        data_start_ = data_start; data_bytes_ = filesize_ - (8 + hlen);
         parse_header(hdr, hlen, data_start);
     }
     ~SafeTensors() { if (base_ && base_ != MAP_FAILED) munmap((void*)base_, filesize_); if (fd_ >= 0) close(fd_); }
 
+    const uint8_t* dataStart() const { return data_start_; }
+    size_t dataBytes() const { return data_bytes_; }
     bool has(const std::string& name) const { return tensors_.count(name) > 0; }
     const Tensor& get(const std::string& name) const {
         auto it = tensors_.find(name);
@@ -100,6 +103,7 @@ private:
         } while (j.eat(','));
     }
     int fd_ = -1; size_t filesize_ = 0; const uint8_t* base_ = nullptr;
+    const uint8_t* data_start_ = nullptr; size_t data_bytes_ = 0;
     std::unordered_map<std::string, Tensor> tensors_;
 };
 

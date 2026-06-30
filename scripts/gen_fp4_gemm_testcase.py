@@ -23,7 +23,7 @@ rng = np.random.default_rng(1234)
 M = int(sys.argv[2]) if len(sys.argv) > 2 else 128
 N = int(sys.argv[3]) if len(sys.argv) > 3 else 256
 K = int(sys.argv[4]) if len(sys.argv) > 4 else 128   # M,N mult 128; K mult 64 (and 16) per recipe tiling
-assert K % 16 == 0 and M % 128 == 0 and N % 128 == 0 and K % 64 == 0
+assert K % 16 == 0   # block size; M/N arbitrary (scale buffer pads internally)
 KB = K // 16                      # blocks along K
 
 # Exact E2M1 value table (index 0..15): sign-magnitude, mag {0,.5,1,1.5,2,3,4,6}
