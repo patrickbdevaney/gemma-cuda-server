@@ -112,6 +112,10 @@ __global__ void k_argmax(int* out,const float* lg,int V){
 // ---- device-MoE kernels (no host round-trip; indexes expert weights by device top-8 ids) ----
 __device__ __forceinline__ float e2m1d(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
 __device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
+__constant__ float C_LUT[256];   // e4m3 byte -> value, computed once (no per-block recompute)
+static void init_clut(){ float h[256]; for(int i=0;i<256;++i){ int s=(i>>7)&1,e=(i>>3)&0xF,man=i&7;
+    float v=(e==0)?(man*0.125f*0.015625f):((1.f+man*0.125f)*ldexp(1.0,e-7)); h[i]=s?-v:v; }
+    CU(cudaMemcpyToSymbol(C_LUT,h,sizeof(h))); }
 // router hidden: hn[mtok,H] = rmsnorm_noscale(resid) * router_scale * H^-0.5  (one block/token)
 __global__ void k_router_hn(float* hn,const float* resid,const uint16_t* rscale,int mtok,int H){
     int t=blockIdx.x; const float* x=resid+(size_t)t*H; __shared__ float red[256];
@@ -145,12 +149,11 @@ __global__ void k_moe_gateup(float* hbuf,const float* x2,const int* ids,
     const uint8_t* const* up,const uint8_t* const* us,const float* ug,int mtok,int H,int MI){
     long idx=blockIdx.x; int i=idx%MI; long rest=idx/MI; int j=rest%8,t=rest/8; int e=ids[(size_t)t*8+j];
     const float* x=x2+(size_t)t*H;
-    __shared__ float lut[256]; for(int z=threadIdx.x;z<256;z+=blockDim.x) lut[z]=e4m3d((uint8_t)z); __syncthreads();
     const unsigned* gpw=(const unsigned*)(gp[e]+(size_t)i*(H/2)); const uint8_t* gsw=gs[e]+(size_t)i*(H/16); float ginv=1.f/gg[e];
     const unsigned* upw=(const unsigned*)(up[e]+(size_t)i*(H/2)); const uint8_t* usw=us[e]+(size_t)i*(H/16); float uinv=1.f/ug[e];
     __shared__ float rg[256],ru[256]; float ag=0,au=0; int nu=H/8;
     for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; const float* xv=x+k;
-        unsigned wg=gpw[vi]; float sg=lut[gsw[k>>4]]*ginv; unsigned wu=upw[vi]; float su=lut[usw[k>>4]]*uinv;
+        unsigned wg=gpw[vi]; float sg=C_LUT[gsw[k>>4]]*ginv; unsigned wu=upw[vi]; float su=C_LUT[usw[k>>4]]*uinv;
         #pragma unroll
         for(int q=0;q<8;++q){ float xq=xv[q]; ag+=e2m1d((uint8_t)((wg>>(q*4))&0xF))*sg*xq; au+=e2m1d((uint8_t)((wu>>(q*4))&0xF))*su*xq; } }
     rg[threadIdx.x]=ag; ru[threadIdx.x]=au; __syncthreads();
@@ -162,12 +165,11 @@ __global__ void k_moe_gateup(float* hbuf,const float* x2,const int* ids,
 __global__ void k_moe_down(float* out,const float* hbuf,const int* ids,const float* ws,
     const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int mtok,int H,int MI){
     long idx=blockIdx.x; int d=idx%H,t=idx/H;
-    __shared__ float lut[256]; for(int z=threadIdx.x;z<256;z+=blockDim.x) lut[z]=e4m3d((uint8_t)z); __syncthreads();
     __shared__ float red[256]; float acc=0; int nu=MI/8;
     for(int j=0;j<8;++j){ int e=ids[(size_t)t*8+j]; float w=ws[(size_t)t*8+j];
         const unsigned* dpw=(const unsigned*)(dp[e]+(size_t)d*(MI/2)); const uint8_t* dsw=ds[e]+(size_t)d*(MI/16); float dinv=1.f/dg[e];
         const float* hh=hbuf+((size_t)t*8+j)*MI; float s=0;
-        for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; unsigned wd=dpw[vi]; float sc=lut[dsw[k>>4]]*dinv; const float* hv=hh+k;
+        for(int vi=threadIdx.x;vi<nu;vi+=blockDim.x){ int k=vi*8; unsigned wd=dpw[vi]; float sc=C_LUT[dsw[k>>4]]*dinv; const float* hv=hh+k;
             #pragma unroll
             for(int q=0;q<8;++q) s+=e2m1d((uint8_t)((wd>>(q*4))&0xF))*sc*hv[q]; }
         red[threadIdx.x]=s; __syncthreads();
@@ -388,7 +390,7 @@ int main(int argc,char**argv){
     std::string ckpt = argc>1?argv[1]:std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-it-NVFP4/model.safetensors";
     std::string tokfile = argc>2?argv[2]:"/tmp/tokens.txt";
     if(getenv("CTX")) CAP=atoi(getenv("CTX"));
-    Model m(ckpt); SC=new Scratch(); DS=new DScratch(); Session* S=new Session();
+    Model m(ckpt); SC=new Scratch(); DS=new DScratch(); init_clut(); Session* S=new Session();
     // read token ids
     std::vector<int> ids; { FILE* f=fopen(tokfile.c_str(),"r"); int t; while(fscanf(f,"%d",&t)==1)ids.push_back(t); fclose(f);}
     int seq=ids.size(); printf("seq=%d tokens, CAP=%d\n",seq,CAP);
