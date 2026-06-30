@@ -103,9 +103,70 @@ __global__ void k_argmax(int* out,const float* lg,int V){
     if(threadIdx.x==0) out[p]=si[0];
 }
 
+// ---- device-MoE kernels (no host round-trip; indexes expert weights by device top-8 ids) ----
+__device__ __forceinline__ float e2m1d(uint8_t c){ const float t[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f}; float v=t[c&7]; return (c&8)?-v:v; }
+__device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):((1.f+man*0.125f)*exp2f((float)(e-7))); return s?-v:v; }
+// router scores[mtok,NE] = (rmsnorm_noscale(resid)*router_scale*H^-0.5) @ router_proj^T
+__global__ void k_router_scores(float* scores,const float* resid,const uint16_t* rproj,const uint16_t* rscale,int mtok,int H,int NE){
+    int t=blockIdx.x; const float* x=resid+(size_t)t*H;
+    extern __shared__ float sh[]; float* hn=sh; float* red=sh+H;
+    float ls=0; for(int i=threadIdx.x;i<H;i+=blockDim.x) ls+=x[i]*x[i];
+    red[threadIdx.x]=ls; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
+    float inv=rsqrtf(red[0]/H+1e-6f), root=rsqrtf((float)H);
+    for(int i=threadIdx.x;i<H;i+=blockDim.x) hn[i]=x[i]*inv*bf2f(rscale[i])*root;
+    __syncthreads();
+    for(int e=0;e<NE;++e){ const uint16_t* w=rproj+(size_t)e*H; float a=0;
+        for(int i=threadIdx.x;i<H;i+=blockDim.x) a+=hn[i]*bf2f(w[i]);
+        red[threadIdx.x]=a; __syncthreads();
+        for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
+        if(threadIdx.x==0) scores[(size_t)t*NE+e]=red[0]; __syncthreads(); }
+}
+// softmax over NE -> top-K (by score) -> renorm to sum 1 -> *per_expert_scale. one thread/token.
+__global__ void k_router_top8(int* ids,float* ws,const float* scores,const uint16_t* pes,int NE,int K){
+    int t=blockIdx.x; if(threadIdx.x) return; const float* sc=scores+(size_t)t*NE;
+    float mx=-1e30f; for(int e=0;e<NE;++e) mx=fmaxf(mx,sc[e]); float Z=0; for(int e=0;e<NE;++e) Z+=__expf(sc[e]-mx);
+    bool used[128]; for(int e=0;e<NE;++e) used[e]=false; float sumw=0; int sel[16]; float selp[16];
+    for(int j=0;j<K;++j){ float best=-1e30f; int bi=0; for(int e=0;e<NE;++e) if(!used[e]&&sc[e]>best){best=sc[e];bi=e;} used[bi]=true; sel[j]=bi; selp[j]=__expf(sc[bi]-mx)/Z; sumw+=selp[j]; }
+    for(int j=0;j<K;++j){ ids[(size_t)t*K+j]=sel[j]; ws[(size_t)t*K+j]=(selp[j]/sumw)*bf2f(pes[sel[j]]); }
+}
+// expert gate/up: hbuf[t,j,i] = gelu(Wg_e[i]·x2[t]) * (Wu_e[i]·x2[t]); one block per (t,j,i)
+__global__ void k_moe_gateup(float* hbuf,const float* x2,const int* ids,
+    const uint8_t* const* gp,const uint8_t* const* gs,const float* gg,
+    const uint8_t* const* up,const uint8_t* const* us,const float* ug,int H,int MI){
+    long idx=blockIdx.x; int i=idx%MI; long rest=idx/MI; int j=rest%8,t=rest/8; int e=ids[(size_t)t*8+j];
+    const float* x=x2+(size_t)t*H;
+    const uint8_t* gpw=gp[e]+(size_t)i*(H/2); const uint8_t* gsw=gs[e]+(size_t)i*(H/16); float ginv=1.f/gg[e];
+    const uint8_t* upw=up[e]+(size_t)i*(H/2); const uint8_t* usw=us[e]+(size_t)i*(H/16); float uinv=1.f/ug[e];
+    __shared__ float rg[256],ru[256]; float ag=0,au=0;
+    for(int k=threadIdx.x;k<H;k+=blockDim.x){
+        uint8_t gb=gpw[k>>1],gc=(k&1)?(gb>>4):(gb&0xF); ag+=e2m1d(gc)*(e4m3d(gsw[k>>4])*ginv)*x[k];
+        uint8_t ub=upw[k>>1],uc=(k&1)?(ub>>4):(ub&0xF); au+=e2m1d(uc)*(e4m3d(usw[k>>4])*uinv)*x[k]; }
+    rg[threadIdx.x]=ag; ru[threadIdx.x]=au; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s){rg[threadIdx.x]+=rg[threadIdx.x+s];ru[threadIdx.x]+=ru[threadIdx.x+s];} __syncthreads(); }
+    if(threadIdx.x==0){ float g=rg[0]; float gel=0.5f*g*(1.f+tanhf(0.7978845608f*(g+0.044715f*g*g*g))); hbuf[idx]=gel*ru[0]; }
+}
+// expert down + weighted sum: out[t,d] = sum_j ws[t,j] * (Wd_e[d]·hbuf[t,j]); one block per (t,d)
+__global__ void k_moe_down(float* out,const float* hbuf,const int* ids,const float* ws,
+    const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int H,int MI){
+    long idx=blockIdx.x; int d=idx%H,t=idx/H; __shared__ float red[256]; float acc=0;
+    for(int j=0;j<8;++j){ int e=ids[(size_t)t*8+j]; float w=ws[(size_t)t*8+j];
+        const uint8_t* dpw=dp[e]+(size_t)d*(MI/2); const uint8_t* dsw=ds[e]+(size_t)d*(MI/16); float dinv=1.f/dg[e];
+        const float* hh=hbuf+((size_t)t*8+j)*MI; float s=0;
+        for(int i=threadIdx.x;i<MI;i+=blockDim.x){ uint8_t b=dpw[i>>1],c=(i&1)?(b>>4):(b&0xF); s+=e2m1d(c)*(e4m3d(dsw[i>>4])*dinv)*hh[i]; }
+        red[threadIdx.x]=s; __syncthreads();
+        for(int sf=128;sf>0;sf>>=1){ if(threadIdx.x<sf)red[threadIdx.x]+=red[threadIdx.x+sf]; __syncthreads(); }
+        if(threadIdx.x==0) acc+=w*red[0]; __syncthreads(); }
+    if(threadIdx.x==0) out[(size_t)t*H+d]=acc;
+}
+
+// device pointer arrays for one layer's 128 experts (indexable by device top-8 id)
+struct ExpertPtrs { const uint8_t **gp,**gs,**up,**us,**dp,**ds; float *gg,*ug,*dg; };
+
 // ---- Model ----
 struct Model {
     st::SafeTensors* st; uint8_t* draw; const uint8_t* h0;
+    std::unordered_map<int,ExpertPtrs> ecache;
     cublasLtHandle_t lt; void* ws; size_t wsb=64u<<20;
     std::unordered_map<std::string,uint8_t*> swz;   // swizzled scales
     std::unordered_map<std::string,uint8_t*> wpk;   // aligned packed-weight copies (cublasLt needs 16B align)
@@ -122,6 +183,22 @@ struct Model {
     template<class P> P dptr(const std::string& n){ return (P)(draw + (st->get(n).data - h0)); }
     float scalarF32(const std::string& n){ float v; memcpy(&v, st->get(n).data, 4); return v; }
     float scalarBf16(const std::string& n){ uint16_t b; memcpy(&b, st->get(n).data,2); unsigned u=(unsigned)b<<16; float f; memcpy(&f,&u,4); return f; }
+    // device pointer arrays for layer L's 128 experts (cached) — for the device-MoE kernels
+    ExpertPtrs* experts(int L){
+        auto it=ecache.find(L); if(it!=ecache.end()) return &it->second;
+        std::string P="model.language_model.layers."+std::to_string(L)+".experts.";
+        std::vector<const uint8_t*> hgp(128),hgs(128),hup(128),hus(128),hdp(128),hds(128);
+        std::vector<float> hgg(128),hug(128),hdg(128);
+        for(int e=0;e<128;++e){ std::string E=P+std::to_string(e)+".";
+            hgp[e]=dptr<const uint8_t*>(E+"gate_proj.weight_packed"); hgs[e]=dptr<const uint8_t*>(E+"gate_proj.weight_scale"); hgg[e]=scalarF32(E+"gate_proj.weight_global_scale");
+            hup[e]=dptr<const uint8_t*>(E+"up_proj.weight_packed");   hus[e]=dptr<const uint8_t*>(E+"up_proj.weight_scale");   hug[e]=scalarF32(E+"up_proj.weight_global_scale");
+            hdp[e]=dptr<const uint8_t*>(E+"down_proj.weight_packed"); hds[e]=dptr<const uint8_t*>(E+"down_proj.weight_scale"); hdg[e]=scalarF32(E+"down_proj.weight_global_scale"); }
+        ExpertPtrs ep;
+        auto P8=[&](const std::vector<const uint8_t*>& hv,const uint8_t**& dv){ CU(cudaMalloc(&dv,128*sizeof(uint8_t*))); CU(cudaMemcpy(dv,hv.data(),128*sizeof(uint8_t*),cudaMemcpyHostToDevice)); };
+        auto PF=[&](const std::vector<float>& hv,float*& dv){ CU(cudaMalloc(&dv,128*4)); CU(cudaMemcpy(dv,hv.data(),128*4,cudaMemcpyHostToDevice)); };
+        P8(hgp,ep.gp);P8(hgs,ep.gs);P8(hup,ep.up);P8(hus,ep.us);P8(hdp,ep.dp);P8(hds,ep.ds); PF(hgg,ep.gg);PF(hug,ep.ug);PF(hdg,ep.dg);
+        return &ecache.emplace(L,ep).first->second;
+    }
     // aligned packed-weight device copy (cached) — cublasLt FP4 requires aligned operands
     uint8_t* wpacked(const std::string& wname){
         auto it=wpk.find(wname); if(it!=wpk.end())return it->second;
@@ -249,35 +326,19 @@ static void moe(Model& m, float* h, int seq, int L){
     gelu_tanh(g,g,seq*MLP_INT,0); k_mul<<<(seq*MLP_INT+255)/256,256>>>(g,u,seq*MLP_INT);
     linear(m,hs1,g,P+"mlp.down_proj",seq,H,MLP_INT);
     rmsnorm(hs1,hs1,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_1.weight"),seq,H,EPS,0);
-    // router on resid (host)
-    std::vector<float> rh(seq*H); CU(cudaMemcpy(rh.data(),resid,(size_t)seq*H*4,cudaMemcpyDeviceToHost));
-    const auto& rscale=bf16_host(m,P+"router.scale"); const auto& rproj=bf16_host(m,P+"router.proj.weight"); const auto& pes=bf16_host(m,P+"router.per_expert_scale");
-    double root=1.0/sqrt((double)H);
-    std::vector<std::vector<std::pair<int,float>>> route(seq);
-    for(int t=0;t<seq;++t){
-        const float* x=&rh[(size_t)t*H]; double ms=0; for(int i=0;i<H;++i)ms+=(double)x[i]*x[i]; double inv=1.0/sqrt(ms/H+EPS);
-        std::vector<float> hn(H); for(int i=0;i<H;++i)hn[i]=(float)(x[i]*inv*rscale[i]*root);
-        std::vector<float> sc(NEXP); for(int e=0;e<NEXP;++e){ double a=0; const float* w=&rproj[(size_t)e*H]; for(int i=0;i<H;++i)a+=hn[i]*w[i]; sc[e]=(float)a; }
-        double mx=-1e30; for(float v:sc)mx=std::max(mx,(double)v); double Z=0; for(int e=0;e<NEXP;++e){sc[e]=expf(sc[e]-mx);Z+=sc[e];} for(int e=0;e<NEXP;++e)sc[e]/=Z;
-        std::vector<int> idx(NEXP); for(int e=0;e<NEXP;++e)idx[e]=e;
-        std::partial_sort(idx.begin(),idx.begin()+TOPK,idx.end(),[&](int a,int b){return sc[a]>sc[b];});
-        double s=0; for(int j=0;j<TOPK;++j)s+=sc[idx[j]];
-        for(int j=0;j<TOPK;++j){ float w=(float)(sc[idx[j]]/s)*pes[idx[j]]; route[t].push_back({idx[j],w}); }
-    }
-    // x2 = pre_ff_norm_2(resid); experts
+    // ---- device router (no host round-trip) ----
+    float* scores; CU(cudaMalloc(&scores,(size_t)seq*NEXP*4));
+    int* top8_ids; float* top8_w; CU(cudaMalloc(&top8_ids,(size_t)seq*TOPK*4)); CU(cudaMalloc(&top8_w,(size_t)seq*TOPK*4));
+    k_router_scores<<<seq,256,(size_t)(H+256)*4>>>(scores, resid, m.dptr<const uint16_t*>(P+"router.proj.weight"), m.dptr<const uint16_t*>(P+"router.scale"), seq, H, NEXP);
+    k_router_top8<<<seq,1>>>(top8_ids, top8_w, scores, m.dptr<const uint16_t*>(P+"router.per_expert_scale"), NEXP, TOPK);
+    // x2 = pre_ff_norm_2(resid); device experts (fused, indexed by device top-8 ids)
     float* x2; CU(cudaMalloc(&x2,(size_t)seq*H*4));
     rmsnorm(x2,resid,m.dptr<const uint16_t*>(P+"pre_feedforward_layernorm_2.weight"),seq,H,EPS,0);
-    float* moe_out; CU(cudaMalloc(&moe_out,(size_t)seq*H*4)); CU(cudaMemset(moe_out,0,(size_t)seq*H*4));
-    // group tokens by expert
-    std::vector<std::vector<std::pair<int,float>>> byexp(NEXP); // (token, weight)
-    for(int t=0;t<seq;++t) for(auto&pr:route[t]) byexp[pr.first].push_back({t,pr.second});
-    float* Xe; CU(cudaMalloc(&Xe,(size_t)seq*H*4)); int *didx; float* dw; CU(cudaMalloc(&didx,seq*4)); CU(cudaMalloc(&dw,seq*4));
-    for(int e=0;e<NEXP;++e){ int nt=byexp[e].size(); if(!nt)continue;
-        std::vector<int> ti(nt); std::vector<float> tw(nt); for(int j=0;j<nt;++j){ti[j]=byexp[e][j].first;tw[j]=byexp[e][j].second;}
-        CU(cudaMemcpy(didx,ti.data(),nt*4,cudaMemcpyHostToDevice)); CU(cudaMemcpy(dw,tw.data(),nt*4,cudaMemcpyHostToDevice));
-        k_gather<<<(nt*H+255)/256,256>>>(Xe,x2,didx,nt,H); CU(cudaDeviceSynchronize());
-        expert_ffn(m, P+"experts."+std::to_string(e)+".", Xe, nt, moe_out, didx, dw);
-    }
+    float* hbuf; CU(cudaMalloc(&hbuf,(size_t)seq*TOPK*MOE_INT*4));
+    float* moe_out; CU(cudaMalloc(&moe_out,(size_t)seq*H*4));
+    ExpertPtrs* ep=m.experts(L);
+    k_moe_gateup<<<(unsigned)(seq*TOPK*MOE_INT),256>>>(hbuf, x2, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, H, MOE_INT);
+    k_moe_down<<<(unsigned)(seq*H),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, H, MOE_INT);
     // hs2 = post_ff_norm_2(moe_out); combine; post_ff_norm; residual; layer_scalar
     rmsnorm(moe_out,moe_out,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     add_inplace(hs1, moe_out, seq*H, 0);  // hs1 = hs1 + hs2
@@ -289,7 +350,7 @@ static void moe(Model& m, float* h, int seq, int L){
     CU(cudaMemcpy(sc1,sv.data(),seq*4,cudaMemcpyHostToDevice));
     CU(cudaMemcpy(h, resid, (size_t)seq*H*4, cudaMemcpyDeviceToDevice));
     k_scale_rows<<<(seq*H+255)/256,256>>>(h, sc1, seq, H); CU(cudaDeviceSynchronize()); cudaFree(sc1);
-    cudaFree(resid);cudaFree(mi);cudaFree(g);cudaFree(u);cudaFree(hs1);cudaFree(x2);cudaFree(moe_out);cudaFree(Xe);cudaFree(didx);cudaFree(dw);
+    cudaFree(resid);cudaFree(mi);cudaFree(g);cudaFree(u);cudaFree(hs1);cudaFree(x2);cudaFree(moe_out);cudaFree(scores);cudaFree(top8_ids);cudaFree(top8_w);cudaFree(hbuf);
 }
 
 static bool DUMP=false;
