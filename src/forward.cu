@@ -499,7 +499,7 @@ int main(int argc,char**argv){
         printf("\n[base decode %d tok in %.1f ms = %.2f tok/s]\n", ngen, ms, ngen*1000.0/ms);
     } else {
         // ---- DFlash speculative decode (k drafts/block) ----
-        int k = getenv("DK")?atoi(getenv("DK")):15; k=std::max(1,std::min(15,k));
+        int k = getenv("DK")?atoi(getenv("DK")):14; k=std::max(1,std::min(15,k));  // k=14 optimal (k-sweep)
         DraftModel* dm = draft_load((std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-DFlash/model.safetensors").c_str(), CAP+32);
         uint16_t* embed = m.dptr<uint16_t*>(embn);
         float* taps_blk; CU(cudaMalloc(&taps_blk,(size_t)(k+1)*6*H*4));
