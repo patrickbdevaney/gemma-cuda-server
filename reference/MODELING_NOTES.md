@@ -352,3 +352,26 @@ pre_ff/post_ff) all have weight [2816].
 Temperature is set entirely by learned q_norm/k_norm weights. THIS IS UNUSUAL — verify in 3.4 logit gate.
 
 **Open for 3.2:** exact 'proportional' RoPE attention_scaling factor on cos/sin (see rope_proportional.txt).
+
+---
+## EXACT decoder-layer dataflow (modeling §1399-1456, all 30 layers enable_moe_block=true, PLE off)
+```
+residual = h
+h = input_layernorm(h); h = self_attn(h); h = post_attention_layernorm(h); h = residual + h
+residual = h                                  # FF-block input (pre any FF norm)
+h_mlp   = mlp( pre_feedforward_layernorm(h) ) # DENSE MLP, intermediate 2112, gated gelu_tanh
+hs1     = post_feedforward_layernorm_1(h_mlp)
+# MoE path operates on `residual` (the PRE-FF-norm input!), with its OWN norms:
+probs,topw,topi = router(residual)            # see router below
+hs2     = experts( pre_feedforward_layernorm_2(residual), topi, topw )
+hs2     = post_feedforward_layernorm_2(hs2)
+h       = hs1 + hs2
+h       = post_feedforward_layernorm(h); h = residual + h
+h      *= layer_scalar                        # bf16 [1] per-layer scalar
+```
+Router (Gemma4TextRouter §1347): hn = router.norm(h)[no-weight RMSNorm]; hn = hn * router.scale[2816] * (2816**-0.5);
+scores = hn @ router.proj.weight^T [128]; probs = softmax(scores); topw,topi = topk(probs,8);
+topw /= topw.sum(); topw *= per_expert_scale[topi].
+Experts (§1325): per token's expert e: gate=Wg@x, up=Wu@x; h=gelu_tanh(gate)*up; out=Wd@h; out*=topw; sum per token.
+Embedding: token_emb * sqrt(2816)=53.066 (bf16). Final: norm(h) -> lm_head(tied embed, bf16) -> 30*tanh(logits/30).
+Activation quant for every NVFP4 Linear uses that Linear's STORED input_global_scale (static), gscale=input_global_scale.
