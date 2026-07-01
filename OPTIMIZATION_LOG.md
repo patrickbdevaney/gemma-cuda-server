@@ -120,3 +120,11 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   high (11.14/14 on primes). Path to 110 needs a better BASE drafter (higher accept at same verify cost) =
   training-adjacent (EAGLE-3 feature fusion / deeper diffusion drafter), NOT a kernel/verify-structure change.
   Would help LOW-acceptance workloads (code) where the headroom is large. Champion stays DFlash 59.72.
+
+### [15] Persistent draft query scratch (remove per-propose malloc/free + sync@273) — NEUTRAL, reverted
+- draft query forward malloc'd ~16 fixed-size buffers/propose + freed them (gated by 2 cudaDeviceSynchronize).
+  Made them persistent statics + dropped sync@273 (lm_head is stream-ordered). gate PASS + PARITY.
+- A/B (5 runs each, sorted): champion 60.17-60.65 (med 60.50) vs scratch 60.42-60.65 (med 60.51) = IDENTICAL.
+  The driver caches allocations + the sync overlapped, so the churn was already free. Reverted (neutral).
+- Draft launch-sensitivity probe: CUDA_LAUNCH_BLOCKING 63.59->60.91 = only ~4%; graphing the draft would need
+  refactoring k_attn for growing context (device-side length) — complex for ~4%. Not worth it now.
