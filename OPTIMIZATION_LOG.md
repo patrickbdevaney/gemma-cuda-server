@@ -79,3 +79,10 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   half the load instructions) w/ aligned embed copy. 4-deep hfma2 chain: 49.24 (regressed). 2-deep tree: 50.08.
   Both < uint2 champion 51.22 -> the load-instruction reduction is offset by ILP/register cost; uint2 optimal.
   Reverted. Champion stays DFlash 51.22.
+
+### [10] MoE gateup __launch_bounds__(256,6) — NEUTRAL, reverted
+- ncu: gateup register-limited (48 regs -> 5 blocks/SM; warp limit 6). Forced 6 blocks via launch_bounds.
+  base 34.18->34.34, DFlash 51.78->51.36 (within noise) — compiler likely spilled to fit 6 blocks, offsetting
+  occupancy gain. Reverted. MoE gateup has now resisted ILP (cycle3) + launch_bounds (cycle10).
+  NEXT big lever: grouped/batched MoE verify (structural) — 15 predictable verify tokens share experts;
+  group by expert -> read each active expert weight once (vs per-token). Verify MoE = 34% of DFlash.
