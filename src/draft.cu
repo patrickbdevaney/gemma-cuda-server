@@ -14,6 +14,7 @@
 #include "draft.h"
 #include "safetensors.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,14 +51,17 @@ __global__ void k_linear_bf16_bigM(float* out,const float* x,const uint16_t* W,i
 }
 // warp-per-output-COLUMN (M<=16): weight row W[n] read ONCE, reused across all M tokens (was M re-reads;
 // critical for the M=15 lm_head over the 262144 vocab and the M=16 block query linears).
-__global__ void k_linear_bf16(float* out,const float* x,const uint16_t* W,int M,int N,int K){
+__global__ void k_df32to16(__half* o,const float* x,long n){ long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i<n)o[i]=__float2half(x[i]); }
+__global__ void k_linear_bf16(float* out,const __half* x16,const uint16_t* W,int M,int N,int K){
     int lane=threadIdx.x&31; long n=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
     if(n>=N) return;
     const uint2* wv=(const uint2*)(W+(size_t)n*K);
     float acc[16]; for(int m=0;m<M;++m) acc[m]=0.f; int nv=K/4;
     for(int vi=lane; vi<nv; vi+=32){ uint2 ww=__ldcs(&wv[vi]); const uint16_t* b=(const uint16_t*)&ww; int k=vi*4;
-        float w0=bf2f(b[0]),w1=bf2f(b[1]),w2=bf2f(b[2]),w3=bf2f(b[3]);
-        for(int m=0;m<M;++m){ const float* xv=x+(size_t)m*K+k; acc[m]+=xv[0]*w0+xv[1]*w1+xv[2]*w2+xv[3]*w3; } }
+        __half2 w01=__floats2half2_rn(bf2f(b[0]),bf2f(b[1])), w23=__floats2half2_rn(bf2f(b[2]),bf2f(b[3]));
+        for(int m=0;m<M;++m){ const __half2* xh=(const __half2*)(x16+(size_t)m*K+k);
+            __half2 a=__hfma2(w23,xh[1],__hmul2(w01,xh[0]));
+            acc[m]+=__half2float(__low2half(a))+__half2float(__high2half(a)); } }
     for(int m=0;m<M;++m){
         #pragma unroll
         for(int s=16;s>0;s>>=1) acc[m]+=__shfl_down_sync(0xffffffffu,acc[m],s);
@@ -144,7 +148,10 @@ void draft_free(DraftModel* d){ if(d){ delete d->st; delete d; } }
 // ---- helpers ----
 static void linbf(DraftModel* d,float* out,const float* x,const std::string& wname,int M,int N,int K){
     const uint16_t* W=d->dptr<const uint16_t*>(wname);
-    if(M<=16) k_linear_bf16<<<(unsigned)(((long)N+7)/8),256>>>(out,x,W,M,N,K);          // reuse W across M
+    if(M<=16){                                                                          // half2: fp16 acts, reuse W across M
+        static __half* xf16=nullptr; if(!xf16) CU(cudaMalloc(&xf16,(size_t)16*8192*sizeof(__half)));
+        k_df32to16<<<(unsigned)(((long)M*K+255)/256),256>>>(xf16,x,(long)M*K);
+        k_linear_bf16<<<(unsigned)(((long)N+7)/8),256>>>(out,xf16,W,M,N,K); }
     else      k_linear_bf16_bigM<<<(unsigned)(((long)M*N+7)/8),256>>>(out,x,W,M,N,K);   // large-M context
 }
 static void rmsn(DraftModel* d,float* out,const float* x,const std::string& wname,int rows,int dim){
@@ -265,7 +272,9 @@ void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int
     // ---- (C) logits for the 15 MASK positions (query slots 1..15) -> argmax ----
     float* hmask = hfin + (size_t)1*H;   // rows 1..15
     float* logits; CU(cudaMalloc(&logits,(size_t)NDRAFT*VOCAB*4));
-    { k_linear_bf16<<<(unsigned)(((long)VOCAB+7)/8),256>>>(logits,hmask,lmhead_bf16,NDRAFT,VOCAB,H); }
+    { static __half* lmxf=nullptr; if(!lmxf) CU(cudaMalloc(&lmxf,(size_t)16*H*sizeof(__half)));   // fp16 acts for half2 lm_head
+      k_df32to16<<<(unsigned)(((long)NDRAFT*H+255)/256),256>>>(lmxf,hmask,(long)NDRAFT*H);
+      k_linear_bf16<<<(unsigned)(((long)VOCAB+7)/8),256>>>(logits,lmxf,lmhead_bf16,NDRAFT,VOCAB,H); }
     int* did; CU(cudaMalloc(&did,k*4));               // device argmax: only need k token ids (not 15.7MB logits)
     k_argmax_draft<<<k,256>>>(did,logits,VOCAB);
     CU(cudaMemcpy(out_ids,did,k*4,cudaMemcpyDeviceToHost)); CU(cudaFree(did));

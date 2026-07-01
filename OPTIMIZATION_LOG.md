@@ -45,3 +45,10 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   Base champion 34.18 unchanged (base > DFlash on predictable). Committed (no regression, improves DFlash mode).
   NEXT: draft is the DFlash bottleneck -> profile + graph/optimize the draft (query forward fixed BLK=16;
   context forward variable C -> make incremental). Path to DFlash>base>110.
+
+### [5] Draft k_linear_bf16 -> half2 (fp16 acts + bf16->fp16 weight, __hfma2)
+- draft was 54% of DFlash (k_linear_bf16 43% incl 65ms lm_head, compute-bound: 15 scalar dots/weight-elem).
+  half2: fp16 activations (k_df32to16) + bf16->fp16 weight -> __hfma2 (2 MAC/instr), reuse W across M<=16.
+  Draft is approximate (verify confirms w/ target) so fp16 draft doesn't break parity.
+- correctness: PASS + base/DFlash PARITY, acceptance unchanged (11.14). DFlash 31.34 -> **37.42 tok/s (+19.4%)**,
+  now BEATS base 34.18. **CHAMPION (fastest decode mode = DFlash-predictable 37.42)**. Path to 110 continues.
