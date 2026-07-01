@@ -174,3 +174,10 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
 ### [22] NVFP4 verify lm_head (w4a16_gemm with quantized embed) — CHAMPION (DFlash)
 - verify lmhead k_lmhead_batched_h2 (bf16 embed) -> w4a16_gemm(g_ewp,g_ews,g_egs) (FP4, 4x lighter).
   DFlash 60.9 -> **65.1 (+6.9%)**, output correct (primes intact), accept 11.14 unchanged. CHAMPION.
+
+### [23] NVFP4 draft lm_head — HUGE CHAMPION (DFlash)
+- draft lm_head bf16 -> w4a16_gemm(g_ewp,g_ews,g_egs) (FP4). DFlash 65.1 -> **81.97 (+26%)**. gate PASS.
+- BONUS: accept 11.14 -> **13.33** (+20%)! draft AND verify now use the SAME FP4 lm_head -> draft proposals
+  align with the target's FP4 argmax (consistency win on top of the byte reduction). tau 13.33.
+- Cumulative FP4 lm_head (base+verify+draft): base 34.78->44.5 (+28%), DFlash 60.9->82 (+35%). This was THE lever.
+  Now ~75% of the way to vLLM DFlash 110. NEXT: steps 2 (L2 persist + MoE toward 33% BW) + 3 (full-graph capture).

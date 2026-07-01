@@ -12,6 +12,7 @@
 //                     post_attn_ln; SiLU MLP; resid); final norm.
 //   (C) logits = lm_head @ h[mask slots 1..15]; argmax -> draft ids.
 #include "draft.h"
+#include "fp4_gemm.h"
 #include "safetensors.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -183,6 +184,7 @@ __global__ void k_argmax_draft(int* out,const float* lg,int V){
 // ---------------- propose ----------------
 void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int C,
                    int next_token, const uint16_t* embed_bf16, const uint16_t* lmhead_bf16,
+                   const uint8_t* ewp, const uint8_t* ews, float egs,
                    int* out_ids, int k){
     if(k>NDRAFT) k=NDRAFT;
     int P0 = ctx_pos[C-1]+1;
@@ -277,7 +279,7 @@ void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int
     float* logits; CU(cudaMalloc(&logits,(size_t)NDRAFT*VOCAB*4));
     { static __half* lmxf=nullptr; if(!lmxf) CU(cudaMalloc(&lmxf,(size_t)16*H*sizeof(__half)));   // fp16 acts for half2 lm_head
       k_df32to16<<<(unsigned)(((long)NDRAFT*H+255)/256),256>>>(lmxf,hmask,(long)NDRAFT*H);
-      k_linear_bf16<<<(unsigned)(((long)VOCAB+7)/8),256>>>(logits,lmxf,lmhead_bf16,NDRAFT,VOCAB,H); }
+      w4a16_gemm(logits, ewp, ews, egs, lmxf, NDRAFT, VOCAB, H, 0); }   // NVFP4 draft lm_head (4x lighter than bf16)
     int* did; CU(cudaMalloc(&did,k*4));               // device argmax: only need k token ids (not 15.7MB logits)
     k_argmax_draft<<<k,256>>>(did,logits,VOCAB);
     CU(cudaMemcpy(out_ids,did,k*4,cudaMemcpyDeviceToHost)); CU(cudaFree(did));

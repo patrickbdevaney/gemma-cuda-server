@@ -21,6 +21,7 @@ DraftModel* draft_load(const char* path, int cap);
 //   out_ids    : host int[k], filled with the k draft token ids (argmax, greedy).
 void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int C,
                    int next_token, const uint16_t* embed_bf16, const uint16_t* lmhead_bf16,
+                   const uint8_t* ewp, const uint8_t* ews, float egs,
                    int* out_ids, int k);
 
 void draft_free(DraftModel* d);

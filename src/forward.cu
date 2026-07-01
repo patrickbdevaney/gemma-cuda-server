@@ -694,7 +694,7 @@ int main(int argc,char**argv){
         cudaEventRecord(t0);
         while(ngen<NGEN){
             ctxpos.resize(S->valid_len); for(int i=0;i<S->valid_len;++i) ctxpos[i]=i;
-            draft_propose(dm, taps_ctx, ctxpos.data(), S->valid_len, tok, embed, embed, draft_ids.data(), k);
+            draft_propose(dm, taps_ctx, ctxpos.data(), S->valid_len, tok, embed, embed, g_ewp, g_ews, g_egs, draft_ids.data(), k);
             std::vector<int> block; block.reserve(k+1); block.push_back(tok);
             for(int i=0;i<k;++i) block.push_back(draft_ids[i]);
             CU(cudaMemcpyAsync(DS->dids, block.data(), (k+1)*4, cudaMemcpyHostToDevice, cudaStreamPerThread));
