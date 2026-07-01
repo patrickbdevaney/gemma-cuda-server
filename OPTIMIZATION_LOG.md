@@ -59,3 +59,11 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
 - ROOT FIX (next): context forward reprocesses ALL C tokens each propose (O(C), grows). Make INCREMENTAL:
   persistent draft context-KV cache, only project the newly-committed na+1 positions each step (M<=16 ->
   efficient warp-per-n). Big win especially as sequence grows. Champion stays DFlash 37.42.
+
+### [7] Incremental draft context K/V  — CHAMPION
+- context forward was O(C): reprocessed ALL committed positions each propose. Now persists a per-layer draft
+  context-KV cache (DraftModel.ctx_done) and projects only the newly-committed positions [ctx_done..C-1]
+  (<=16 -> efficient half2 warp-per-n) each step. Also fixed latent bug: half2 xf16 buffer was 16*8192 but
+  fc has K=FCIN=16896 (overflow when fc hit the M<=16 path) -> sized 16*FCIN.
+- correctness: PASS + PARITY, acceptance unchanged (11.14). DFlash 37.42 -> **42.05 tok/s (+12.4%)**. CHAMPION.
+  Scales better as sequence grows (O(committed) not O(C) per step). base 34.18 unchanged.

@@ -128,7 +128,7 @@ __global__ void k_silu_mul(float* g,const float* u,int n){
 // ---------------- model ----------------
 struct DraftModel {
     st::SafeTensors* st; uint8_t* draw; const uint8_t* h0; int cap, slots;
-    float* Kc[NL]; float* Vc[NL];
+    float* Kc[NL]; float* Vc[NL]; int ctx_done=0;   // # context positions already projected into the draft KV cache
     DraftModel(const char* path,int cap_):cap(cap_){
         st=new st::SafeTensors(path); h0=st->dataStart();
         CU(cudaMalloc(&draw, st->dataBytes()));
@@ -149,7 +149,7 @@ void draft_free(DraftModel* d){ if(d){ delete d->st; delete d; } }
 static void linbf(DraftModel* d,float* out,const float* x,const std::string& wname,int M,int N,int K){
     const uint16_t* W=d->dptr<const uint16_t*>(wname);
     if(M<=16){                                                                          // half2: fp16 acts, reuse W across M
-        static __half* xf16=nullptr; if(!xf16) CU(cudaMalloc(&xf16,(size_t)16*8192*sizeof(__half)));
+        static __half* xf16=nullptr; if(!xf16) CU(cudaMalloc(&xf16,(size_t)16*FCIN*sizeof(__half)));   // K up to FCIN=16896 (fc)
         k_df32to16<<<(unsigned)(((long)M*K+255)/256),256>>>(xf16,x,(long)M*K);
         k_linear_bf16<<<(unsigned)(((long)N+7)/8),256>>>(out,xf16,W,M,N,K); }
     else      k_linear_bf16_bigM<<<(unsigned)(((long)M*N+7)/8),256>>>(out,x,W,M,N,K);   // large-M context
@@ -187,24 +187,27 @@ void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int
     if(k>NDRAFT) k=NDRAFT;
     int P0 = ctx_pos[C-1]+1;
 
-    // ---- (A) context K/V into draft cache ----
-    // fused = fc @ concat6(taps)   (taps[C,6,2816] is already concat -> [C,16896])
-    float *fused,*fused_n; CU(cudaMalloc(&fused,(size_t)C*H*4)); CU(cudaMalloc(&fused_n,(size_t)C*H*4));
-    linbf(d, fused, taps_dev, "fc.weight", C, H, FCIN);
-    rmsn(d, fused_n, fused, "hidden_norm.weight", C, H);
-    // context positions on device (slots) + RoPE tables for them
-    int* ctx_dev; CU(cudaMalloc(&ctx_dev,C*4)); CU(cudaMemcpy(ctx_dev,ctx_pos,C*4,cudaMemcpyHostToDevice));
-    float *cdc,*cds; rope_tables(ctx_pos,C,&cdc,&cds);
-    float *Kctx,*Vctx; CU(cudaMalloc(&Kctx,(size_t)C*KD*4)); CU(cudaMalloc(&Vctx,(size_t)C*KD*4));
-    for(int l=0;l<NL;++l){
-        linbf(d, Kctx, fused_n, LP(l,"self_attn.k_proj.weight"), C, KD, H);
-        linbf(d, Vctx, fused_n, LP(l,"self_attn.v_proj.weight"), C, KD, H);
-        rmsn(d, Kctx, Kctx, LP(l,"self_attn.k_norm.weight"), C*NKV, HD);   // per-head k_norm
-        { dim3 g(NKV,C); k_rope<<<g,HD/2>>>(Kctx,cdc,cds,NKV,HD); }        // V NOT roped
-        k_store_kv<<<(C*KD+255)/256,256>>>(d->Kc[l],Kctx,ctx_dev,C,NKV,HD);
-        k_store_kv<<<(C*KD+255)/256,256>>>(d->Vc[l],Vctx,ctx_dev,C,NKV,HD);
+    // ---- (A) context K/V into draft cache — INCREMENTAL: only project the newly-committed positions
+    int c0=d->ctx_done; if(c0>C)c0=0; int Cn=C-c0;   // new context positions [c0..C-1]; c0>C guards a fresh sequence
+    if(Cn>0){
+        float *fused,*fused_n; CU(cudaMalloc(&fused,(size_t)Cn*H*4)); CU(cudaMalloc(&fused_n,(size_t)Cn*H*4));
+        linbf(d, fused, taps_dev+(size_t)c0*FCIN, "fc.weight", Cn, H, FCIN);   // taps for new positions
+        rmsn(d, fused_n, fused, "hidden_norm.weight", Cn, H);
+        int* ctx_dev; CU(cudaMalloc(&ctx_dev,Cn*4)); CU(cudaMemcpy(ctx_dev,ctx_pos+c0,Cn*4,cudaMemcpyHostToDevice));
+        float *cdc,*cds; rope_tables(ctx_pos+c0,Cn,&cdc,&cds);
+        float *Kctx,*Vctx; CU(cudaMalloc(&Kctx,(size_t)Cn*KD*4)); CU(cudaMalloc(&Vctx,(size_t)Cn*KD*4));
+        for(int l=0;l<NL;++l){
+            linbf(d, Kctx, fused_n, LP(l,"self_attn.k_proj.weight"), Cn, KD, H);
+            linbf(d, Vctx, fused_n, LP(l,"self_attn.v_proj.weight"), Cn, KD, H);
+            rmsn(d, Kctx, Kctx, LP(l,"self_attn.k_norm.weight"), Cn*NKV, HD);
+            { dim3 g(NKV,Cn); k_rope<<<g,HD/2>>>(Kctx,cdc,cds,NKV,HD); }
+            k_store_kv<<<(Cn*KD+255)/256,256>>>(d->Kc[l],Kctx,ctx_dev,Cn,NKV,HD);
+            k_store_kv<<<(Cn*KD+255)/256,256>>>(d->Vc[l],Vctx,ctx_dev,Cn,NKV,HD);
+        }
+        CU(cudaDeviceSynchronize());
+        cudaFree(fused);cudaFree(fused_n);cudaFree(ctx_dev);cudaFree(cdc);cudaFree(cds);cudaFree(Kctx);cudaFree(Vctx);
     }
-    CU(cudaDeviceSynchronize());
+    d->ctx_done=C;
 
     // ---- (B) query forward over BLK tokens ----
     // qids = [next_token, MASK x15];  qpos = [P0 .. P0+15]
@@ -291,8 +294,7 @@ void draft_propose(DraftModel* d, const float* taps_dev, const int* ctx_pos, int
         FILE* h2=fopen("/tmp/dbg_hfin.bin","wb"); fwrite(hh.data(),4,(size_t)BLK*H,h2); fclose(h2);
         fprintf(stderr,"[DBG_DRAFT dumped C=%d k=%d]\n",C,k); } }
 
-    cudaFree(fused);cudaFree(fused_n);cudaFree(ctx_dev);cudaFree(cdc);cudaFree(cds);
-    cudaFree(Kctx);cudaFree(Vctx);cudaFree(qid_dev);cudaFree(qslot_dev);cudaFree(kslot_dev);
+    cudaFree(qid_dev);cudaFree(qslot_dev);cudaFree(kslot_dev);   // phase-A buffers freed in the incremental block
     cudaFree(qdc);cudaFree(qds);cudaFree(h);cudaFree(resid);cudaFree(hn);cudaFree(q);
     cudaFree(kk);cudaFree(vv);cudaFree(ao);cudaFree(attn);cudaFree(g);cudaFree(u);
     cudaFree(hfin);cudaFree(logits);
