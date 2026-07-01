@@ -163,3 +163,10 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   The down already has 8-way expert ILP; the 16-reg prefetch crushed occupancy (same failure mode as N-blocking).
   Reverted. MLP prefetch helps SERIAL-chain kernels (gateup, w4a16) but hurts already-ILP-rich ones (down).
 - Net MLP-fix result: base 34.18->34.9 (+2.1%), DFlash 60->60.9 (+1.5%). gateup ncu 9.82%->13.6% BW.
+
+### [21] NVFP4 lm_head (quantize embed E2M1+e4m3, reuse fp4_gemv) — BIG CHAMPION (base)
+- lm_head was ~30% of base (1.5GB bf16). Quantized the tied embed to NVFP4 (k_embed_amax -> global scale,
+  k_quant_embed_fp4 -> E2M1 codes + linear e4m3 group-16 scales matching w4a16 dequant). Base lm_head now =
+  fp4_gemv (4x fewer bytes, fast HW FP4 decode - the reason FP8 failed). No softcap (argmax-invariant).
+- gate PASS (FP4 embed accurate enough for greedy argmax on confident tokens). base 34.78 -> **44.5 (+28%)**.
+  Near vLLM base (52). NEXT: apply FP4 lm_head to DFlash draft + verify lmheads (biggest DFlash cost).

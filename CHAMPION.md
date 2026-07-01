@@ -5,7 +5,7 @@ that DFlash builds on; secondary metrics tracked too.
 
 | field | value |
 |---|---|
-| **BASE decode** | **34.18 tok/s** |
+| **BASE decode** | **44.5 tok/s** (FP4 lm_head) |
 |  DFlash (predictable, DK=14) 37.42 tok/s OLD:| 30.58 tok/s, accept 11.14/14 |
 | correctness | gate_self.sh PASS (primes + Paris/Blue/4/Au) |
 | commit | cycle12 grouped-gateup |

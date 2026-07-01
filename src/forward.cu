@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
+#include <cuda_fp8.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@ static const float EPS=1e-6f, SOFTCAP=30.0f;
 static const float EMB_SCALE=53.06599664f;             // sqrt(2816)
 static inline bool is_full(int L){ return L==5||L==11||L==17||L==23||L==29; }
 __device__ int g_base=0;  // decode position read by base-dependent kernels (enables CUDA-graph replay)
+static uint8_t *g_ewp=nullptr,*g_ews=nullptr; static float g_egs=0.f;  // NVFP4-quantized embed (lm_head): codes + e4m3 scales + global scale
 
 // ---- helper kernels ----
 __device__ __forceinline__ float bf2f(uint16_t h){ unsigned u=(unsigned)h<<16; float f; memcpy(&f,&u,4); return f; }
@@ -49,6 +51,30 @@ __global__ void k_lmhead(float* logits,const float* hlast,const uint16_t* emb,in
     red[threadIdx.x]=acc; __syncthreads();
     for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s)red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
     if(threadIdx.x==0){ float x=red[0]; logits[v]=cap*tanhf(x/cap); } }
+
+// ---- NVFP4 lm_head: quantize the bf16 embed to E2M1 codes + E4M3 group-16 scales (w4a16 linear layout) ----
+__device__ __forceinline__ uint8_t q_fp4(float x){ float a=fabsf(x); uint8_t idx;
+    if(a<0.25f)idx=0; else if(a<0.75f)idx=1; else if(a<1.25f)idx=2; else if(a<1.75f)idx=3;
+    else if(a<2.5f)idx=4; else if(a<3.5f)idx=5; else if(a<5.0f)idx=6; else idx=7;
+    return idx|((x<0.0f)?0x8:0x0); }
+__global__ void k_embed_amax(const uint16_t* emb,long total,float* gamax){
+    long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; float a=0.f;
+    for(long i=idx;i<total;i+=(long)gridDim.x*blockDim.x) a=fmaxf(a,fabsf(bf2f(emb[i])));
+    __shared__ float sm[256]; sm[threadIdx.x]=a; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s)sm[threadIdx.x]=fmaxf(sm[threadIdx.x],sm[threadIdx.x+s]); __syncthreads(); }
+    if(threadIdx.x==0) atomicMax((int*)gamax,__float_as_int(sm[0])); }
+__global__ void k_quant_embed_fp4(const uint16_t* emb,uint8_t* wp,uint8_t* ws,int H,int V,float gscale){
+    long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; int KB=H/16; long total=(long)V*KB; if(idx>=total)return;
+    int n=idx/KB, b=idx%KB; const uint16_t* xb=emb+(size_t)n*H+(size_t)b*16;
+    float amax=0.f;
+    #pragma unroll
+    for(int i=0;i<16;++i) amax=fmaxf(amax,fabsf(bf2f(xb[i])));
+    float e4r=gscale*(amax*(1.f/6.f)); __nv_fp8_e4m3 e4=__nv_fp8_e4m3(e4r); float e4v=float(e4);
+    float inv_local=(e4v>0.f)?(gscale/e4v):0.f;   // 1/local, local=e4v/gscale
+    ws[(size_t)n*KB+b]=e4.__x;
+    uint8_t* po=wp+(size_t)n*(H/2)+(size_t)b*8;
+    #pragma unroll
+    for(int i=0;i<8;++i){ uint8_t lo=q_fp4(bf2f(xb[2*i])*inv_local); uint8_t hi=q_fp4(bf2f(xb[2*i+1])*inv_local); po[i]=lo|(hi<<4); } }
 
 // DFlash: capture residual after a tapped target layer into taps[mtok,6,H] at tap slot j
 __global__ void k_tap(float* taps, const float* h, int mtok, int j, int H){
@@ -538,6 +564,14 @@ int main(int argc,char**argv){
     if(getenv("CTX")) CAP=atoi(getenv("CTX"));
     W4A4_TAPS=getenv("W4A4_TAPS")!=nullptr;
     Model m(ckpt); SC=new Scratch(); DS=new DScratch(); init_clut(); Session* S=new Session();
+    {   // quantize the bf16 embed -> NVFP4 (E2M1 + e4m3 group-16 scales) for a 4x-lighter lm_head GEMV
+        const uint16_t* embp=m.dptr<const uint16_t*>("model.language_model.embed_tokens.weight");
+        CU(cudaMalloc(&g_ewp,(size_t)VOCAB*(H/2))); CU(cudaMalloc(&g_ews,(size_t)VOCAB*(H/16)));
+        float* d_amax; CU(cudaMalloc(&d_amax,4)); CU(cudaMemset(d_amax,0,4));
+        k_embed_amax<<<1024,256>>>(embp,(long)VOCAB*H,d_amax);
+        float h_amax; CU(cudaMemcpy(&h_amax,d_amax,4,cudaMemcpyDeviceToHost)); g_egs=2688.f/h_amax;
+        k_quant_embed_fp4<<<(unsigned)(((long)VOCAB*(H/16)+255)/256),256>>>(embp,g_ewp,g_ews,H,VOCAB,g_egs);
+        CU(cudaDeviceSynchronize()); CU(cudaFree(d_amax)); }
     // read token ids
     std::vector<int> ids; { FILE* f=fopen(tokfile.c_str(),"r"); int t; while(fscanf(f,"%d",&t)==1)ids.push_back(t); fclose(f);}
     int seq=ids.size(); printf("seq=%d tokens, CAP=%d\n",seq,CAP);
@@ -558,7 +592,8 @@ int main(int argc,char**argv){
             if(taps){ int j=tap_slot(L); if(j>=0) k_tap<<<(mtok*H+255)/256,256>>>(taps,h,mtok,j,H); } }
         if(prof){cudaEventRecord(b);}
         rmsnorm(DS->hl, h+(size_t)(mtok-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"),1,H,EPS,0);
-        k_lmhead<<<VOCAB,256>>>(DS->dlog, DS->hl, m.dptr<const uint16_t*>(embn), H, VOCAB, SOFTCAP);
+        k_f32_to_f16<<<(H+255)/256,256>>>(DS->xh16, DS->hl, H);   // NVFP4 lm_head: 4x-lighter embed read via fp4_gemv (no softcap; argmax-invariant)
+        fp4_gemv(DS->dlog, g_ewp, g_ews, g_egs, DS->xh16, VOCAB, H, 0);
         if(ftok){ k_argmax<<<1,256>>>(DS->darg, DS->dlog, VOCAB); CU(cudaMemcpy(ftok,DS->darg,4,cudaMemcpyDeviceToHost)); }  // device argmax, copy 1 int (no 1MB host roundtrip)
         else { CU(cudaDeviceSynchronize()); lo.resize(VOCAB); CU(cudaMemcpy(lo.data(),DS->dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost)); }
         if(prof){cudaEventRecord(c);cudaEventSynchronize(c);float ab,bc;cudaEventElapsedTime(&ab,a,b);cudaEventElapsedTime(&bc,b,c);t_layers+=ab;t_head+=bc;
@@ -594,7 +629,8 @@ int main(int argc,char**argv){
             float* h=DS->hmain;
             for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,1,0,L); moe(m,h,1,L); }
             rmsnorm(DS->hl, h, m.dptr<const uint16_t*>("model.language_model.norm.weight"), 1, H, EPS, 0);
-            k_lmhead<<<VOCAB,256>>>(DS->dlog, DS->hl, embw, H, VOCAB, SOFTCAP);
+            k_f32_to_f16<<<(H+255)/256,256>>>(DS->xh16, DS->hl, H);
+            fp4_gemv(DS->dlog, g_ewp, g_ews, g_egs, DS->xh16, VOCAB, H, 0);
             k_argmax<<<1,256>>>(DS->darg, DS->dlog, VOCAB);
             k_advance<<<1,1>>>(DS->dids, DS->darg);
         };
