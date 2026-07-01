@@ -153,3 +153,7 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   while KEEPING warp-per-output (N-blocking regressed: halved warps -> 0.73 waves at M=1 underfill).
 - ncu: 9.82%->13.60% BW, 32%->42.86% compute, 245->184us (-25%). gate PASS. base 34.18 -> ~34.7 (+1.7%).
   Modest end-to-end (gateup is a fraction) but the technique is the key. NEXT: apply to base w4a16 (28%) + down (18%).
+
+### [19] w4a16 (dense linears) K-unroll prefetch — CHAMPION (base + DFlash)
+- same MLP fix on w4a16_gemm_kernel (used by base M=1 dense qkv/o AND DFlash verify M=15). U=4 weight prefetch.
+- gate PASS. base ~34.7->34.9, DFlash 60->60.9 (+1.5%, verify w4a16 benefits too). Both improved. CHAMPION.

@@ -84,16 +84,21 @@ __global__ void w4a16_gemm_kernel(float* out, const uint8_t* wp, const uint8_t* 
     int lane=threadIdx.x&31, n=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5); if(n>=N) return;
     const unsigned* wpn=(const unsigned*)(wp+(size_t)n*(K/2)); const uint8_t* wsn=ws+(size_t)n*(K/16);
     float acc[16]; for(int m=0;m<M;++m) acc[m]=0.f;
-    int nu=K/8;
-    for(int vi=lane; vi<nu; vi+=32){ unsigned w=__ldcs(&wpn[vi]); int k=vi*8; float sc=lut[__ldcs(&wsn[k>>4])];
-        const unsigned char* wb=(const unsigned char*)&w; __half2 wv2[4];   // decode weight ONCE, reuse across M tokens
+    int nu=K/8; const int U=4;   // K-unroll: prefetch U independent weight loads before decode/FMA -> raises MLP (M=1 was serial-chain starved)
+    for(int vi=lane; vi<nu; vi+=32*U){
+        unsigned w[U]; int vv[U];
         #pragma unroll
-        for(int b=0;b<4;++b) wv2[b]=dec_fp4x2(wb[b]);
-        for(int m=0;m<M;++m){ uint4 xpk=*(const uint4*)(x16+(size_t)m*K+k); const __half2* xm=(const __half2*)&xpk;
-            __half2 a2=__float2half2_rn(0.f);
+        for(int u=0;u<U;++u){ int v=vi+u*32; vv[u]=v; if(v<nu) w[u]=__ldcs(&wpn[v]); }   // U loads issued together
+        #pragma unroll
+        for(int u=0;u<U;++u){ int v=vv[u]; if(v>=nu) continue; int k=v*8; float sc=lut[__ldcs(&wsn[k>>4])];
+            const unsigned char* wb=(const unsigned char*)&w[u]; __half2 wv2[4];
             #pragma unroll
-            for(int b=0;b<4;++b) a2=__hfma2(wv2[b], xm[b], a2);   // 2 tokens-worth of MAC per instruction
-            acc[m]+=sc*(__half2float(__low2half(a2))+__half2float(__high2half(a2))); } }
+            for(int b=0;b<4;++b) wv2[b]=dec_fp4x2(wb[b]);
+            for(int m=0;m<M;++m){ uint4 xpk=*(const uint4*)(x16+(size_t)m*K+k); const __half2* xm=(const __half2*)&xpk;
+                __half2 a2=__float2half2_rn(0.f);
+                #pragma unroll
+                for(int b=0;b<4;++b) a2=__hfma2(wv2[b], xm[b], a2);
+                acc[m]+=sc*(__half2float(__low2half(a2))+__half2float(__high2half(a2))); } } }
     for(int m=0;m<M;++m){
         #pragma unroll
         for(int o=16;o>0;o>>=1) acc[m]+=__shfl_down_sync(0xffffffffu,acc[m],o);
