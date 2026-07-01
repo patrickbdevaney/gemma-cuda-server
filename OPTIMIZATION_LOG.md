@@ -73,3 +73,9 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   draft's k_linear_bf16 (half2 warp-per-n, 25ms) for the SAME projection. Added k_lmhead_batched_h2 (half2:
   fp16 hidden + bf16->fp16 embed, reuse embed row across M). correctness PASS + PARITY, accept unchanged.
 - DFlash 42.05 -> **51.22 tok/s (+21.8%)**. CHAMPION. Now matches vLLM base (52). base 34.18 unchanged.
+
+### [9] lmhead uint4 (aligned embed) — LOST
+- ncu: verify lmhead 94% L1/TEX (memory-INSTRUCTION bound), 63% L2, 52% compute. Tried uint4 (8 bf16/load,
+  half the load instructions) w/ aligned embed copy. 4-deep hfma2 chain: 49.24 (regressed). 2-deep tree: 50.08.
+  Both < uint2 champion 51.22 -> the load-instruction reduction is offset by ILP/register cost; uint2 optimal.
+  Reverted. Champion stays DFlash 51.22.
