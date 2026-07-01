@@ -685,7 +685,7 @@ int main(int argc,char**argv){
                 int j=tap_slot(L); if(j>=0) k_tap<<<((k+1)*H+255)/256,256>>>(taps_blk,h,k+1,j,H); }
             rmsnorm(DS->hln, h, m.dptr<const uint16_t*>("model.language_model.norm.weight"), k+1, H, EPS, 0);
             k_f32_to_f16<<<((k+1)*H+255)/256,256>>>(DS->xh16, DS->hln, (k+1)*H);   // fp16 hidden for half2 lmhead
-            k_lmhead_batched_h2<<<(VOCAB+7)/8,256>>>(DS->lg2, DS->xh16, embed, H, VOCAB, k+1);
+            w4a16_gemm(DS->lg2, g_ewp, g_ews, g_egs, DS->xh16, k+1, VOCAB, H, 0);   // NVFP4 verify lm_head (4x lighter)
             k_argmax<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB);
             if(typical) k_typical_prob<<<k,256>>>(DS->tprob, DS->lg2, DS->dids, VOCAB, invT);
         };

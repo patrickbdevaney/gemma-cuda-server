@@ -170,3 +170,7 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   fp4_gemv (4x fewer bytes, fast HW FP4 decode - the reason FP8 failed). No softcap (argmax-invariant).
 - gate PASS (FP4 embed accurate enough for greedy argmax on confident tokens). base 34.78 -> **44.5 (+28%)**.
   Near vLLM base (52). NEXT: apply FP4 lm_head to DFlash draft + verify lmheads (biggest DFlash cost).
+
+### [22] NVFP4 verify lm_head (w4a16_gemm with quantized embed) — CHAMPION (DFlash)
+- verify lmhead k_lmhead_batched_h2 (bf16 embed) -> w4a16_gemm(g_ewp,g_ews,g_egs) (FP4, 4x lighter).
+  DFlash 60.9 -> **65.1 (+6.9%)**, output correct (primes intact), accept 11.14 unchanged. CHAMPION.
