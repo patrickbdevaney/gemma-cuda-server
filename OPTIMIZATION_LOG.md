@@ -146,3 +146,10 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   FAIL (empty/NaN output) — subtle bug in the uint2 reinterpret/act-pairing. Reverted. The gateup is latency/MLP-
   bound; widening loads REDUCES outstanding requests (wrong direction for MLP) anyway. Need occupancy/MLP, which
   hits the 48-reg limit. NEXT: research the vLLM base-decode (52) + DFlash (110) efficiency to find the real technique.
+
+### [18] base MoE gateup K-unroll prefetch (MLP fix) — CHAMPION (base)
+- Research: base gateup MLP-starved (serial FMA chain -> 1-2 loads in flight -> 9.82% BW, 3-5x below naive).
+  Fix = K-unroll U=4: issue U independent weight loads BEFORE the FMA block (raises memory-level parallelism)
+  while KEEPING warp-per-output (N-blocking regressed: halved warps -> 0.73 waves at M=1 underfill).
+- ncu: 9.82%->13.60% BW, 32%->42.86% compute, 245->184us (-25%). gate PASS. base 34.18 -> ~34.7 (+1.7%).
+  Modest end-to-end (gateup is a fraction) but the technique is the key. NEXT: apply to base w4a16 (28%) + down (18%).

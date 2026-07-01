@@ -213,16 +213,21 @@ __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
     const __half* x=x2+(size_t)t*H;
     const unsigned* gpw=(const unsigned*)(gp[e]+(size_t)i*(H/2)); const uint8_t* gsw=gs[e]+(size_t)i*(H/16); float ginv=1.f/gg[e];
     const unsigned* upw=(const unsigned*)(up[e]+(size_t)i*(H/2)); const uint8_t* usw=us[e]+(size_t)i*(H/16); float uinv=1.f/ug[e];
-    float ag=0,au=0; int nu=H/8;
-    for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
-        uint4 xpk=*(const uint4*)(x+k); const __half2* xh2=(const __half2*)&xpk;  // 8 fp16 acts (4 half2)
-        unsigned wg=__ldcs(&gpw[vi]); float sg=C_LUT[__ldcs(&gsw[k>>4])]*ginv; unsigned wu=__ldcs(&upw[vi]); float su=C_LUT[__ldcs(&usw[k>>4])]*uinv;
-        const unsigned char* wgb=(const unsigned char*)&wg; const unsigned char* wub=(const unsigned char*)&wu;
-        __half2 g2=__float2half2_rn(0.f),u2=__float2half2_rn(0.f);
+    float ag=0,au=0; int nu=H/8; const int U=4;   // K-unroll: prefetch U independent weight loads before FMA -> raises MLP (fixes serial-chain latency stall)
+    for(int vi=lane;vi<nu;vi+=32*U){
+        unsigned wg[U],wu[U]; int vv[U];
         #pragma unroll
-        for(int b=0;b<4;++b){ g2=__hfma2(dec_fp4x2(wgb[b]),xh2[b],g2); u2=__hfma2(dec_fp4x2(wub[b]),xh2[b],u2); }
-        ag += sg*(__half2float(__low2half(g2))+__half2float(__high2half(g2)));
-        au += su*(__half2float(__low2half(u2))+__half2float(__high2half(u2))); }
+        for(int u=0;u<U;++u){ int v=vi+u*32; vv[u]=v; if(v<nu){ wg[u]=__ldcs(&gpw[v]); wu[u]=__ldcs(&upw[v]); } }   // U loads issued together
+        #pragma unroll
+        for(int u=0;u<U;++u){ int v=vv[u]; if(v>=nu) continue; int k=v*8;
+            uint4 xpk=*(const uint4*)(x+k); const __half2* xh2=(const __half2*)&xpk;   // activation (L2-cached, low latency)
+            float sg=C_LUT[__ldcs(&gsw[k>>4])]*ginv, su=C_LUT[__ldcs(&usw[k>>4])]*uinv;
+            const unsigned char* wgb=(const unsigned char*)&wg[u]; const unsigned char* wub=(const unsigned char*)&wu[u];
+            __half2 g2=__float2half2_rn(0.f),u2=__float2half2_rn(0.f);
+            #pragma unroll
+            for(int b=0;b<4;++b){ g2=__hfma2(dec_fp4x2(wgb[b]),xh2[b],g2); u2=__hfma2(dec_fp4x2(wub[b]),xh2[b],u2); }
+            ag += sg*(__half2float(__low2half(g2))+__half2float(__high2half(g2)));
+            au += su*(__half2float(__low2half(u2))+__half2float(__high2half(u2))); } }
     #pragma unroll
     for(int o=16;o>0;o>>=1){ ag+=__shfl_down_sync(0xffffffffu,ag,o); au+=__shfl_down_sync(0xffffffffu,au,o); }
     if(lane==0){ float gel=0.5f*ag*(1.f+tanhf(0.7978845608f*(ag+0.044715f*ag*ag*ag))); hbuf[idx]=__float2half(gel*au); }
