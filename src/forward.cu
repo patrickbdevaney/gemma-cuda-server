@@ -214,6 +214,39 @@ __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
     for(int o=16;o>0;o>>=1){ ag+=__shfl_down_sync(0xffffffffu,ag,o); au+=__shfl_down_sync(0xffffffffu,au,o); }
     if(lane==0){ float gel=0.5f*ag*(1.f+tanhf(0.7978845608f*(ag+0.044715f*ag*ag*ag))); hbuf[idx]=__float2half(gel*au); }
 }
+// inverse routing: ecount[e]=#assignments to e; elist[e*EL+c]=c-th (t*8+j) routing to e.
+__global__ void k_moe_invert(int* ecount,int* elist,const int* ids,int nass,int EL){
+    int idx=blockIdx.x*blockDim.x+threadIdx.x; if(idx>=nass)return;
+    int e=ids[idx]; int c=atomicAdd(&ecount[e],1); if(c<EL) elist[e*EL+c]=idx;
+}
+// GROUPED gateup: warp per (e,i). Read+decode Wg_e[i]/Wu_e[i] ONCE, reuse across the tokens routing to e (<=4/pass).
+__global__ void k_moe_gateup_grouped(__half* hbuf,const __half* x2,const int* ecount,const int* elist,int EL,
+    const uint8_t* const* gp,const uint8_t* const* gs,const float* gg,
+    const uint8_t* const* up,const uint8_t* const* us,const float* ug,int H,int MI){
+    int lane=threadIdx.x&31; long idx=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+    int i=idx%MI; int e=idx/MI; if(e>=128)return; int cnt=ecount[e]; if(cnt==0)return;
+    const unsigned* gpw=(const unsigned*)(gp[e]+(size_t)i*(H/2)); const uint8_t* gsw=gs[e]+(size_t)i*(H/16); float ginv=1.f/gg[e];
+    const unsigned* upw=(const unsigned*)(up[e]+(size_t)i*(H/2)); const uint8_t* usw=us[e]+(size_t)i*(H/16); float uinv=1.f/ug[e];
+    int nu=H/8;
+    for(int base=0;base<cnt;base+=4){ int nb=cnt-base; if(nb>4)nb=4;
+        float ag[4]={0,0,0,0},au[4]={0,0,0,0}; const __half* xp[4];
+        for(int c=0;c<nb;++c){ xp[c]=x2+(size_t)(elist[e*EL+base+c]/8)*H; }
+        for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
+            unsigned wg=__ldcs(&gpw[vi]); float sg=C_LUT[__ldcs(&gsw[k>>4])]*ginv; unsigned wu=__ldcs(&upw[vi]); float su=C_LUT[__ldcs(&usw[k>>4])]*uinv;
+            const unsigned char* wgb=(const unsigned char*)&wg; const unsigned char* wub=(const unsigned char*)&wu;
+            __half2 gd0=dec_fp4x2(wgb[0]),gd1=dec_fp4x2(wgb[1]),gd2=dec_fp4x2(wgb[2]),gd3=dec_fp4x2(wgb[3]);
+            __half2 ud0=dec_fp4x2(wub[0]),ud1=dec_fp4x2(wub[1]),ud2=dec_fp4x2(wub[2]),ud3=dec_fp4x2(wub[3]);
+            for(int c=0;c<nb;++c){ uint4 xpk=*(const uint4*)(xp[c]+k); const __half2* x=(const __half2*)&xpk;
+                __half2 g2=__hadd2(__hadd2(__hmul2(gd0,x[0]),__hmul2(gd1,x[1])),__hadd2(__hmul2(gd2,x[2]),__hmul2(gd3,x[3])));
+                __half2 u2=__hadd2(__hadd2(__hmul2(ud0,x[0]),__hmul2(ud1,x[1])),__hadd2(__hmul2(ud2,x[2]),__hmul2(ud3,x[3])));
+                ag[c]+=sg*(__half2float(__low2half(g2))+__half2float(__high2half(g2)));
+                au[c]+=su*(__half2float(__low2half(u2))+__half2float(__high2half(u2))); } }
+        for(int c=0;c<nb;++c){
+            #pragma unroll
+            for(int o=16;o>0;o>>=1){ ag[c]+=__shfl_down_sync(0xffffffffu,ag[c],o); au[c]+=__shfl_down_sync(0xffffffffu,au[c],o); }
+            if(lane==0){ int tj=elist[e*EL+base+c]; float g=ag[c]; float gel=0.5f*g*(1.f+tanhf(0.7978845608f*(g+0.044715f*g*g*g))); hbuf[(size_t)tj*MI+i]=__float2half(gel*au[c]); } }
+    }
+}
 // expert down: out[t,d] = sum_j ws[t,j]*(Wd_e[d]·hbuf[t,j]). WARP per (t,d): lanes stride over MI/8,
 // 8 experts FUSED into one accumulator -> ONE shfl reduce (vs 8 block reductions + 34% thread util before).
 __global__ void k_moe_down(float* out,const __half* hbuf,const int* ids,const float* ws,
@@ -319,7 +352,7 @@ static const int MAXM=16, QDMAX=16*512, KDMAX=16*512;
 struct DScratch {
     float *hmain,*hn,*q,*k,*v,*ao,*op,*dc,*ds;
     float *resid,*mi,*g,*u,*hs1,*x2,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
-    float *hl,*dlog,*hln,*lg2,*aq; int* darg; __half *xh16,*hbuf,*x2_16;
+    float *hl,*dlog,*hln,*lg2,*aq; int* darg,*ecount,*elist; __half *xh16,*hbuf,*x2_16;
     DScratch(){ auto A=[&](float*&p,size_t n){ CU(cudaMalloc(&p,n*4)); };
         CU(cudaMalloc(&xh16,(size_t)MAXM*8192*sizeof(__half)));  // fp16 activation scratch: M=1 GEMV[K] or M<=16 GEMM[M,K]
         CU(cudaMalloc(&aq,(size_t)MAXM*8192*4));  // W4A4-emulation activation round-trip scratch
@@ -328,7 +361,8 @@ struct DScratch {
         A(hmain,MAXM*H);A(hn,MAXM*H);A(q,MAXM*QDMAX);A(k,MAXM*KDMAX);A(v,MAXM*KDMAX);A(ao,MAXM*QDMAX);A(op,MAXM*H);
         A(dc,MAXM*256);A(ds,MAXM*256);A(resid,MAXM*H);A(mi,MAXM*H);A(g,MAXM*MLP_INT);A(u,MAXM*MLP_INT);A(hs1,MAXM*H);
         A(x2,MAXM*H);A(moe_out,MAXM*H);A(scores,MAXM*128);A(top8_w,MAXM*8);A(sc1,MAXM);
-        CU(cudaMalloc(&top8_ids,MAXM*8*4)); CU(cudaMalloc(&dids,MAXM*4)); }
+        CU(cudaMalloc(&top8_ids,MAXM*8*4)); CU(cudaMalloc(&dids,MAXM*4));
+        CU(cudaMalloc(&ecount,128*4)); CU(cudaMalloc(&elist,128*16*4)); }
 };
 static DScratch* DS;
 
@@ -458,6 +492,11 @@ static void moe(Model& m, float* h, int seq, int L){
     if(W4A4_TAPS) k_fp4_roundtrip<<<(unsigned)(((long)seq*H/16+255)/256),256>>>(x2,(long)seq*H);  // W4A4 emul (MoE act)
     k_f32_to_f16<<<(seq*H+255)/256,256>>>(x2_16, x2, seq*H);  // fp16 MoE activation for HW-decode gateup
     ExpertPtrs* ep=m.experts(L);
+    if(seq>1 && seq<=16){   // verify: GROUPED gateup (reuse each expert weight across tokens routing to it; EL=16 cap)
+        CU(cudaMemsetAsync(DS->ecount,0,128*4,0));
+        k_moe_invert<<<(seq*8+255)/256,256>>>(DS->ecount, DS->elist, top8_ids, seq*8, 16);
+        k_moe_gateup_grouped<<<(unsigned)((128*MOE_INT+7)/8),256>>>(hbuf, x2_16, DS->ecount, DS->elist, 16, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, H, MOE_INT);
+    } else
     k_moe_gateup<<<(unsigned)((seq*TOPK*MOE_INT+7)/8),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
     k_moe_down<<<(unsigned)((seq*(H/2)+7)/8),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
     rmsnorm(moe_out,moe_out,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_2.weight"),seq,H,EPS,0);

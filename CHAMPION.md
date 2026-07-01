@@ -8,7 +8,7 @@ that DFlash builds on; secondary metrics tracked too.
 | **BASE decode** | **34.18 tok/s** |
 |  DFlash (predictable, DK=14) 37.42 tok/s OLD:| 30.58 tok/s, accept 11.14/14 |
 | correctness | gate_self.sh PASS (primes + Paris/Blue/4/Au) |
-| commit | cycle8 half2-verify-lmhead |
+| commit | cycle12 grouped-gateup |
 | date | 2026-06-30 |
 | context depth | prompt ~25 tok, decode 60 |
 | memory | 16.4 GB weights |

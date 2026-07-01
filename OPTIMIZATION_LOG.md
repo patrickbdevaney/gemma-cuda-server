@@ -94,3 +94,11 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   DFlash 51.87->49.96 (-3.7%). The fp8x2->half2 HW decode overhead offsets the halved loads on Thor, and the
   lmhead isn't purely byte-bound (base M=1 memory+decode, verify M=15 L1-instruction+decode). Reverted.
   NOTE: FP8 decode is NOT free on sm_110a; byte-reduction levers must beat the decode cost. bf16 lmhead optimal.
+
+### [12] Grouped-GEMM verify MoE gateup  — CHAMPION
+- verify MoE was per-output (warp per (t,j,i)) -> each expert weight read per (token,expert). Now: k_moe_invert
+  builds expert->tokens map (atomics), k_moe_gateup_grouped = warp per (e,i), read+decode Wg_e[i]/Wu_e[i] ONCE,
+  reuse across the <=4 tokens/pass routing to e (register-bounded ag/au[4] to avoid the ILP register pressure).
+  Only for seq<=16 (verify); prefill/base per-output. Captured in verify graph (memset+atomics capturable).
+- correctness PASS + PARITY, accept unchanged. DFlash 51.87 -> **59.72 tok/s (+15.1%)** (> the 1.5x reuse estimate:
+  also cut warp count + relieved latency). CHAMPION. This is the enabler that makes tree-verify net-positive.
