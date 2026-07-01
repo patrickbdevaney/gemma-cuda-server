@@ -128,3 +128,14 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   The driver caches allocations + the sync overlapped, so the churn was already free. Reverted (neutral).
 - Draft launch-sensitivity probe: CUDA_LAUNCH_BLOCKING 63.59->60.91 = only ~4%; graphing the draft would need
   refactoring k_attn for growing context (device-side length) — complex for ~4%. Not worth it now.
+
+### [16] T>0 typical (Medusa) acceptance — implemented (feature; no-op on primes, valid for low-accept workloads)
+- k_typical_prob: per-position target softmax prob (temp 1/invT) of the draft token; accept iff prob>=TYP_EPS
+  (TYP_EPS=0 -> exact greedy, byte-identical, EXACT PARITY verified). Gated by TYP_EPS + TEMP env.
+- MEASURED on primes: no-op (accept 11.14 unchanged across eps 0.02-0.15, T 0.3-2.0). T=4/eps0.09 CRASHES to 4.33
+  (flat dist drops argmax below eps). Reason: primes draft has NO acceptance headroom (tail = hard errors, not
+  near-misses) — same root cause tree/multi-round didn't help. Kept as production feature for LOW-accept workloads.
+- KEY REFRAME: acceptance-based levers are exhausted on primes (draft near-optimal at 11.14/14). The gap to vLLM
+  DFlash (110) is EFFICIENCY: my BASE decode 34 tok/s = only 36% of the ~94 tok/s roofline (2.9GB/step: 1.4 FP4
+  weight + 1.5 bf16 lmhead). vLLM base=52 (72% higher). Closing the base BW gap scales DFlash too. NEXT: profile
+  base-decode kernels' achieved DRAM BW; find where the 64% is lost.

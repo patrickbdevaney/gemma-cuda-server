@@ -127,6 +127,19 @@ __global__ void k_argmax(int* out,const float* lg,int V){
     if(threadIdx.x==0) out[p]=si[0];
 }
 
+// typical acceptance: per position i, target softmax prob (at temp 1/invT) of the draft token block[i+1].
+__global__ void k_typical_prob(float* prob,const float* logits,const int* block,int V,float invT){
+    int i=blockIdx.x; const float* lg=logits+(size_t)i*V; int dt=block[i+1];
+    __shared__ float red[256];
+    float mx=-1e30f; for(int v=threadIdx.x;v<V;v+=256) mx=fmaxf(mx,lg[v]);
+    red[threadIdx.x]=mx; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s) red[threadIdx.x]=fmaxf(red[threadIdx.x],red[threadIdx.x+s]); __syncthreads(); }
+    mx=red[0]; __syncthreads();
+    float se=0.f; for(int v=threadIdx.x;v<V;v+=256) se+=__expf((lg[v]-mx)*invT);
+    red[threadIdx.x]=se; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s) red[threadIdx.x]+=red[threadIdx.x+s]; __syncthreads(); }
+    if(threadIdx.x==0) prob[i]=__expf((lg[dt]-mx)*invT)/red[0];
+}
 // CUDA-graph self-advance: feed argmax back as next input token + increment position (all on-device)
 __global__ void k_advance(int* dids,const int* darg){ if(threadIdx.x==0){ dids[0]=darg[0]; g_base++; } }
 // ---- device-MoE kernels (no host round-trip; indexes expert weights by device top-8 ids) ----
@@ -352,7 +365,7 @@ static const int MAXM=16, QDMAX=16*512, KDMAX=16*512;
 struct DScratch {
     float *hmain,*hn,*q,*k,*v,*ao,*op,*dc,*ds;
     float *resid,*mi,*g,*u,*hs1,*x2,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
-    float *hl,*dlog,*hln,*lg2,*aq; int* darg,*ecount,*elist; __half *xh16,*hbuf,*x2_16;
+    float *hl,*dlog,*hln,*lg2,*aq,*tprob; int* darg,*ecount,*elist; __half *xh16,*hbuf,*x2_16;
     DScratch(){ auto A=[&](float*&p,size_t n){ CU(cudaMalloc(&p,n*4)); };
         CU(cudaMalloc(&xh16,(size_t)MAXM*8192*sizeof(__half)));  // fp16 activation scratch: M=1 GEMV[K] or M<=16 GEMM[M,K]
         CU(cudaMalloc(&aq,(size_t)MAXM*8192*4));  // W4A4-emulation activation round-trip scratch
@@ -362,7 +375,7 @@ struct DScratch {
         A(dc,MAXM*256);A(ds,MAXM*256);A(resid,MAXM*H);A(mi,MAXM*H);A(g,MAXM*MLP_INT);A(u,MAXM*MLP_INT);A(hs1,MAXM*H);
         A(x2,MAXM*H);A(moe_out,MAXM*H);A(scores,MAXM*128);A(top8_w,MAXM*8);A(sc1,MAXM);
         CU(cudaMalloc(&top8_ids,MAXM*8*4)); CU(cudaMalloc(&dids,MAXM*4));
-        CU(cudaMalloc(&ecount,128*4)); CU(cudaMalloc(&elist,128*16*4)); }
+        CU(cudaMalloc(&ecount,128*4)); CU(cudaMalloc(&elist,128*16*4)); CU(cudaMalloc(&tprob,MAXM*4)); }
 };
 static DScratch* DS;
 
@@ -620,6 +633,9 @@ int main(int argc,char**argv){
         float* taps_blk; CU(cudaMalloc(&taps_blk,(size_t)(k+1)*6*H*4));
         std::vector<int> draft_ids(k), allarg, ctxpos;
         int steps=0, accepted_sum=0;
+        float typEps = getenv("TYP_EPS")?atof(getenv("TYP_EPS")):0.f;   // Medusa typical acceptance (T>0); 0 = exact greedy
+        float invT = 1.f/(getenv("TEMP")?atof(getenv("TEMP")):1.f); bool typical = typEps>0.f;
+        std::vector<float> tprob(k);
         // verify forward (fixed M=k+1) as a CUDA graph: reads DS->dids (block) + g_base, writes taps_blk + DS->darg
         auto verify_step=[&](){
             k_embed<<<k+1,256>>>(DS->hmain, embed, DS->dids, k+1, H, EMB_SCALE);
@@ -630,6 +646,7 @@ int main(int argc,char**argv){
             k_f32_to_f16<<<((k+1)*H+255)/256,256>>>(DS->xh16, DS->hln, (k+1)*H);   // fp16 hidden for half2 lmhead
             k_lmhead_batched_h2<<<(VOCAB+7)/8,256>>>(DS->lg2, DS->xh16, embed, H, VOCAB, k+1);
             k_argmax<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB);
+            if(typical) k_typical_prob<<<k,256>>>(DS->tprob, DS->lg2, DS->dids, VOCAB, invT);
         };
         bool vUseGraph=!getenv("NOGRAPH"); bool vCap=false; cudaGraph_t vg; cudaGraphExec_t vexec;
         allarg.resize(k+1);
@@ -648,10 +665,13 @@ int main(int argc,char**argv){
                 else CU(cudaGraphLaunch(vexec,cudaStreamPerThread));
             } else verify_step();
             CU(cudaMemcpyAsync(allarg.data(), DS->darg, (k+1)*4, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            if(typical) CU(cudaMemcpyAsync(tprob.data(), DS->tprob, k*4, cudaMemcpyDeviceToHost, cudaStreamPerThread));
             CU(cudaStreamSynchronize(cudaStreamPerThread));   // verify done; allarg[0..k], taps_blk[0..k] ready
             if(getenv("DBG_DRAFT")){ static int d2=0; if(!d2){ d2=1; FILE* f=fopen("/tmp/dbg_target.txt","w");
                 for(int i=0;i<=k;++i) fprintf(f,"%d ",allarg[i]); fprintf(f,"\n"); fclose(f); } }
-            int na=0; for(int i=0;i<k;++i){ if(draft_ids[i]==allarg[i]) na++; else break; }
+            // exact greedy: accept iff draft==argmax.  typical (T>0): accept iff target prob(draft) >= eps (accepts near-misses)
+            int na=0; if(typical){ for(int i=0;i<k;++i){ if(tprob[i]>=typEps) na++; else break; } }
+                      else       { for(int i=0;i<k;++i){ if(draft_ids[i]==allarg[i]) na++; else break; } }
             int newbonus = allarg[na];
             printf("%d ",tok); fflush(stdout); ngen++;
             bool stop = (tok==1||tok==106);
