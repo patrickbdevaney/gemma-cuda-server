@@ -181,3 +181,10 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   align with the target's FP4 argmax (consistency win on top of the byte reduction). tau 13.33.
 - Cumulative FP4 lm_head (base+verify+draft): base 34.78->44.5 (+28%), DFlash 60.9->82 (+35%). This was THE lever.
   Now ~75% of the way to vLLM DFlash 110. NEXT: steps 2 (L2 persist + MoE toward 33% BW) + 3 (full-graph capture).
+
+### [24] L2 persistence on MoE activation (step 2) — NEUTRAL, reverted
+- pinned x2_16 (90KB fp16 activation) in L2 via cudaAccessPolicyWindow. base 44.5->44.2, DFlash 82->81.7 (neutral).
+  Thor's L2 already holds the small activation (no eviction to prevent). Reverted. MoE also at MLP limit (U=8 neutral).
+  Step 2 exhausted on Thor. Step 3 (full-graph): DFlash host tax only ~5% (81.2 vs 77.1 blocking) + draft has a
+  GROWING attention context (hard to graph) -> poor ROI. Path to 110 now needs TENSOR CORES for the compute-bound
+  M=15 verify dense/MoE GEMMs (lmhead already memory-bound 60.9%, so TC won't help it; dense+MoE would).
