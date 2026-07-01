@@ -52,3 +52,10 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   Draft is approximate (verify confirms w/ target) so fp16 draft doesn't break parity.
 - correctness: PASS + base/DFlash PARITY, acceptance unchanged (11.14). DFlash 31.34 -> **37.42 tok/s (+19.4%)**,
   now BEATS base 34.18. **CHAMPION (fastest decode mode = DFlash-predictable 37.42)**. Path to 110 continues.
+
+### [6] Draft bigM (context) -> half2  — NEUTRAL, reverted
+- context fc/kv_proj use k_linear_bf16_bigM (warp-per-(m,n)) -> weight read M=C times (redundant), so it's
+  MEMORY-bound on redundant reads, not compute-bound. half2 gave 37.42->37.26 (neutral). Reverted.
+- ROOT FIX (next): context forward reprocesses ALL C tokens each propose (O(C), grows). Make INCREMENTAL:
+  persistent draft context-KV cache, only project the newly-committed na+1 positions each step (M<=16 ->
+  efficient warp-per-n). Big win especially as sequence grows. Champion stays DFlash 37.42.
