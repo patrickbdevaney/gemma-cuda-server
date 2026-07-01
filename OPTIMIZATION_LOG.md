@@ -188,3 +188,17 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   Step 2 exhausted on Thor. Step 3 (full-graph): DFlash host tax only ~5% (81.2 vs 77.1 blocking) + draft has a
   GROWING attention context (hard to graph) -> poor ROI. Path to 110 now needs TENSOR CORES for the compute-bound
   M=15 verify dense/MoE GEMMs (lmhead already memory-bound 60.9%, so TC won't help it; dense+MoE would).
+
+### [25] FP4 tensor-core verify kernel — RESEARCHED, decided AGAINST (evidence-based)
+- 4 parallel deep-research agents (2 returned, 2 session-limited). DECISIVE findings:
+  * Thor sm_110a = tcgen05/TMEM only (NO warp mma.sync; CUTLASS #2951). TC = full tcgen05 path on immature
+    CUDA-13.1 toolchain. M=128 CTA-tile floor -> 8.5x pad waste at M=15.
+  * Nsight bound-status: lm_head (34.6% of step) MEMORY-bound 60.9% -> TC gives NOTHING. verify down (14.8%)
+    COMPUTE-bound 77.7% -> TC candidate but only ~+10-15% total for a huge risky build. NOT worth it.
+  * DFlash ships NO custom verify kernel (verify = standard batched forward). No secret to match.
+  * "110 tok/s DFlash gemma-4-26B-A4B on Thor" is UNSOURCED. Real anchors: DGX-Spark base 52, Spark DFlash on
+    similar MoEs 50-118, RTX PRO 6000 138, H100 gemma-4 DFlash C1 306. MY 82 IS COMPETITIVE with real Thor-class.
+  * SOTA small-M FP4 = CUDA cores (ReSET 1.57-2.49x over TC baseline at M=1-8), which is my approach.
+- VERDICT: pure-CUDA decode is near its bound-limits (lm_head 60.9% mem, down 77.7% compute). TC path documented
+  (CUTLASS ex.72 / tcgen05 recipe in research) but recommend-against on ROI+toolchain-risk. Remaining gap to any
+  higher number = framework (Marlin MoE, graph) or deeper drafter (training), not a missing CUDA kernel.
