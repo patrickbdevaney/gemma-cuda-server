@@ -17,3 +17,12 @@ Hardware ceiling note: A4B active ≈ 1.4 GB FP4 weight/token; at Thor 273 GB/s 
 ceiling for base (realistic ~70-90 well-tuned). DFlash on predictable can exceed base. Target: well-exceed 110.
 
 Reproduce: `bash scripts/gate_self.sh && bash scripts/bench.sh`
+
+---
+## BANKED — pure-CUDA baseline (2026-07-01)
+Stable, gated baseline. base 44 tok/s, DFlash 82 (easy) / 58 (hard workload), accept 13.33/14.
+Full loop: base 29.9->44 (+47%), DFlash 30.6->82 (+168%). THE lever = NVFP4 lm_head.
+Reference: vLLM DFlash = 100-105 tok/s on same model/hardware (mature flashinfer/cutlass TC + full graph
++ bf16 lm_head). Our draft is BETTER (tau 10-13 vs vLLM 7.84); our gap is per-step kernel efficiency.
+TC-verify/full-graph synthesis toward 110-140 is being developed in ~/gemma-cuda-hybrid (CUTLASS FP4
+proven to compile+run on Thor sm_110a/CUDA13.0). This repo stays the stable pure-CUDA reference.
