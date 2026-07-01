@@ -102,3 +102,8 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   Only for seq<=16 (verify); prefill/base per-output. Captured in verify graph (memset+atomics capturable).
 - correctness PASS + PARITY, accept unchanged. DFlash 51.87 -> **59.72 tok/s (+15.1%)** (> the 1.5x reuse estimate:
   also cut warp count + relieved latency). CHAMPION. This is the enabler that makes tree-verify net-positive.
+
+### [13] Grouped verify MoE down (atomicAdd) — NEUTRAL, reverted
+- grouped down (warp per (e,d), reuse Wd_e[d] across tokens, atomicAdd to moe_out). 59.72->59.37 (neutral):
+  atomicAdd overhead offset the ~1.5x weight reuse, and the down was already warp-fused-efficient (8 experts/warp).
+  Reverted. Champion stays DFlash 59.72 (grouped gateup only). down grouping not worth the atomics.
