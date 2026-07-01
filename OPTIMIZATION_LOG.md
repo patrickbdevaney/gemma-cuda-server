@@ -139,3 +139,10 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   DFlash (110) is EFFICIENCY: my BASE decode 34 tok/s = only 36% of the ~94 tok/s roofline (2.9GB/step: 1.4 FP4
   weight + 1.5 bf16 lmhead). vLLM base=52 (72% higher). Closing the base BW gap scales DFlash too. NEXT: profile
   base-decode kernels' achieved DRAM BW; find where the 64% is lost.
+
+### [17] base MoE gateup uint2 weight loads (128->widen) — LOST (broke correctness)
+- base gateup ncu: 9.82% DRAM BW / 32% compute / 66% occ = LATENCY-bound (15.8MB weight in 245us = 10x slow).
+  Tried uint2 weight loads (16 FP4 codes = 1 scale group; half the load instr + scale lookups). Built but GATE
+  FAIL (empty/NaN output) — subtle bug in the uint2 reinterpret/act-pairing. Reverted. The gateup is latency/MLP-
+  bound; widening loads REDUCES outstanding requests (wrong direction for MLP) anyway. Need occupancy/MLP, which
+  hits the 48-reg limit. NEXT: research the vLLM base-decode (52) + DFlash (110) efficiency to find the real technique.
