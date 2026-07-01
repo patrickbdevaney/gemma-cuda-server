@@ -567,13 +567,34 @@ int main(int argc,char**argv){
         float* taps_blk; CU(cudaMalloc(&taps_blk,(size_t)(k+1)*6*H*4));
         std::vector<int> draft_ids(k), allarg, ctxpos;
         int steps=0, accepted_sum=0;
+        // verify forward (fixed M=k+1) as a CUDA graph: reads DS->dids (block) + g_base, writes taps_blk + DS->darg
+        auto verify_step=[&](){
+            k_embed<<<k+1,256>>>(DS->hmain, embed, DS->dids, k+1, H, EMB_SCALE);
+            float* h=DS->hmain;
+            for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,k+1,0,L); moe(m,h,k+1,L);
+                int j=tap_slot(L); if(j>=0) k_tap<<<((k+1)*H+255)/256,256>>>(taps_blk,h,k+1,j,H); }
+            rmsnorm(DS->hln, h, m.dptr<const uint16_t*>("model.language_model.norm.weight"), k+1, H, EPS, 0);
+            k_lmhead_batched<<<VOCAB,256,(size_t)H*4>>>(DS->lg2, DS->hln, embed, H, VOCAB, k+1);
+            k_argmax<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB);
+        };
+        bool vUseGraph=!getenv("NOGRAPH"); bool vCap=false; cudaGraph_t vg; cudaGraphExec_t vexec;
+        allarg.resize(k+1);
         cudaEventRecord(t0);
         while(ngen<NGEN){
             ctxpos.resize(S->valid_len); for(int i=0;i<S->valid_len;++i) ctxpos[i]=i;
             draft_propose(dm, taps_ctx, ctxpos.data(), S->valid_len, tok, embed, embed, draft_ids.data(), k);
             std::vector<int> block; block.reserve(k+1); block.push_back(tok);
             for(int i=0;i<k;++i) block.push_back(draft_ids[i]);
-            run(block, S->valid_len, logits, taps_blk, &allarg);   // caches block KV, taps_blk[0..k], allarg[0..k]
+            CU(cudaMemcpyAsync(DS->dids, block.data(), (k+1)*4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            CU(cudaMemcpyToSymbolAsync(g_base, &S->valid_len, sizeof(int), 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            if(vUseGraph){
+                if(!vCap){ verify_step(); CU(cudaStreamSynchronize(cudaStreamPerThread));   // step0 eager (lazy init) + capture
+                    CU(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)); verify_step();
+                    CU(cudaStreamEndCapture(cudaStreamPerThread,&vg)); CU(cudaGraphInstantiate(&vexec,vg,0)); vCap=true; }
+                else CU(cudaGraphLaunch(vexec,cudaStreamPerThread));
+            } else verify_step();
+            CU(cudaMemcpyAsync(allarg.data(), DS->darg, (k+1)*4, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CU(cudaStreamSynchronize(cudaStreamPerThread));   // verify done; allarg[0..k], taps_blk[0..k] ready
             if(getenv("DBG_DRAFT")){ static int d2=0; if(!d2){ d2=1; FILE* f=fopen("/tmp/dbg_target.txt","w");
                 for(int i=0;i<=k;++i) fprintf(f,"%d ",allarg[i]); fprintf(f,"\n"); fclose(f); } }
             int na=0; for(int i=0;i<k;++i){ if(draft_ids[i]==allarg[i]) na++; else break; }

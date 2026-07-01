@@ -37,3 +37,11 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
 - ncu: gateup 9.74% mem / 32% compute = LATENCY-bound (247us x 30 = 7.4ms/step). Tried 2 fp32 accumulators +
   2-wide vi unroll for ILP. correctness PASS but base 34.18 -> 33.55 (REGRESSED, likely register pressure).
   Discarded, reverted. Champion stays 34.18. NEXT: check gateup occupancy/registers; or different ILP shape.
+
+### [4] DFlash verify forward as CUDA graph
+- change: verify_step (fixed M=k+1) captured as graph (reads DS->dids block + g_base, writes taps_blk + darg),
+  draft stays eager (variable context shape). correctness: PASS + base/DFlash PARITY.
+- DFlash (predictable) 30.6 -> 31.34 tok/s (+2.4%). Modest because DRAFT now dominates the step (eager).
+  Base champion 34.18 unchanged (base > DFlash on predictable). Committed (no regression, improves DFlash mode).
+  NEXT: draft is the DFlash bottleneck -> profile + graph/optimize the draft (query forward fixed BLK=16;
+  context forward variable C -> make incremental). Path to DFlash>base>110.
