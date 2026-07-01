@@ -107,3 +107,16 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
 - grouped down (warp per (e,d), reuse Wd_e[d] across tokens, atomicAdd to moe_out). 59.72->59.37 (neutral):
   atomicAdd overhead offset the ~1.5x weight reuse, and the down was already warp-fused-efficient (8 experts/warp).
   Reverted. Champion stays DFlash 59.72 (grouped gateup only). down grouping not worth the atomics.
+
+### [14] Tree verification (tested via multi-round verify)  — LOST (data-confirmed net-negative)
+- Tree-verify for block-diffusion DFlash: full top-k tree explodes combinatorially (fork continuations at unknown
+  positions); the tractable proxy is MULTI-ROUND verify (re-verify the draft tail conditioned on the corrected
+  bonus; draft tokens are position-fixed in block diffusion so reusable, no re-propose).
+- MEASURED (MROUND env, A/B): baseline 59.07 tok/s / 7 steps / tau 11.43  vs  multi-round 57.27 tok/s / 6 steps /
+  tau 13.33. So +16% tokens-per-draft (PARITY held) but -3% SPEED: each extra round is a full weight-bound forward
+  that costs more than the recovered tail tokens. A one-forward tree saves the weight re-reads but grouped-MoE +
+  lmhead still scale with candidate count -> ~0.98x (break-even) on this high-acceptance benchmark. Reverted.
+- CONCLUSION: extra-candidate verification can't overcome the per-token verify cost when base acceptance is already
+  high (11.14/14 on primes). Path to 110 needs a better BASE drafter (higher accept at same verify cost) =
+  training-adjacent (EAGLE-3 feature fusion / deeper diffusion drafter), NOT a kernel/verify-structure change.
+  Would help LOW-acceptance workloads (code) where the headroom is large. Champion stays DFlash 59.72.
