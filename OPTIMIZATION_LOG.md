@@ -157,3 +157,9 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
 ### [19] w4a16 (dense linears) K-unroll prefetch — CHAMPION (base + DFlash)
 - same MLP fix on w4a16_gemm_kernel (used by base M=1 dense qkv/o AND DFlash verify M=15). U=4 weight prefetch.
 - gate PASS. base ~34.7->34.9, DFlash 60->60.9 (+1.5%, verify w4a16 benefits too). Both improved. CHAMPION.
+
+### [20] MoE down K-unroll prefetch (8-expert weights) — LOST (register pressure), reverted
+- prefetched all 8 experts' wd0/wd1 (16 uint regs) before FMAs. base 34.9->34.1, DFlash 60.9->59.2 (regressed).
+  The down already has 8-way expert ILP; the 16-reg prefetch crushed occupancy (same failure mode as N-blocking).
+  Reverted. MLP prefetch helps SERIAL-chain kernels (gateup, w4a16) but hurts already-ILP-rich ones (down).
+- Net MLP-fix result: base 34.18->34.9 (+2.1%), DFlash 60->60.9 (+1.5%). gateup ncu 9.82%->13.6% BW.
