@@ -86,3 +86,11 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   occupancy gain. Reverted. MoE gateup has now resisted ILP (cycle3) + launch_bounds (cycle10).
   NEXT big lever: grouped/batched MoE verify (structural) — 15 predictable verify tokens share experts;
   group by expert -> read each active expert weight once (vs per-token). Verify MoE = 34% of DFlash.
+
+### [11] FP8-e4m3 lm_head (per-row scaled embed)  — LOST (both base & verify)
+- Research #1 lever: lm_head=44% of per-step bytes; FP8 halves embed read. Implemented per-row-scaled FP8
+  embed (k_embed_to_fp8) + FP8 base lmhead + FP8 verify lmhead (HW __nv_cvt_fp8x2_to_halfraw2, 8 fp8/uint2).
+- correctness PASS + PARITY (greedy argmax robust to FP8, as research predicted). BUT: base 34.18->32.3 (-5.5%),
+  DFlash 51.87->49.96 (-3.7%). The fp8x2->half2 HW decode overhead offsets the halved loads on Thor, and the
+  lmhead isn't purely byte-bound (base M=1 memory+decode, verify M=15 L1-instruction+decode). Reverted.
+  NOTE: FP8 decode is NOT free on sm_110a; byte-reduction levers must beat the decode cost. bf16 lmhead optimal.
