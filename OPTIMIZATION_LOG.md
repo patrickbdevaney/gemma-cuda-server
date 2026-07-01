@@ -67,3 +67,9 @@ Format: `[cycle] candidate | correctness | base tok/s | champion? | note`
   fc has K=FCIN=16896 (overflow when fc hit the M<=16 path) -> sized 16*FCIN.
 - correctness: PASS + PARITY, acceptance unchanged (11.14). DFlash 37.42 -> **42.05 tok/s (+12.4%)**. CHAMPION.
   Scales better as sequence grows (O(committed) not O(C) per step). base 34.18 unchanged.
+
+### [8] Verify lmhead -> half2 warp-per-vocab  — CHAMPION
+- verify k_lmhead_batched (block-per-vocab, scalar, shared-staging) was 75ms for M=15 — 3x slower than the
+  draft's k_linear_bf16 (half2 warp-per-n, 25ms) for the SAME projection. Added k_lmhead_batched_h2 (half2:
+  fp16 hidden + bf16->fp16 embed, reuse embed row across M). correctness PASS + PARITY, accept unchanged.
+- DFlash 42.05 -> **51.22 tok/s (+21.8%)**. CHAMPION. Now matches vLLM base (52). base 34.18 unchanged.

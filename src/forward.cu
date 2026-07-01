@@ -103,6 +103,20 @@ __global__ void k_lmhead_batched(float* out,const float* hn,const uint16_t* emb,
 }
 __global__ void k_scale_const(float* x,float s,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) x[i]*=s; }
 __global__ void k_f32_to_f16(__half* out,const float* in,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) out[i]=__float2half(in[i]); }
+// batched lm_head, HALF2 warp-per-vocab: embed row read ONCE, mtok dots via __hfma2 (3x faster than scalar block-per-vocab)
+__global__ void k_lmhead_batched_h2(float* out,const __half* hn16,const uint16_t* emb,int H,int V,int mtok){
+    int lane=threadIdx.x&31; long v=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5); if(v>=V)return;
+    const uint2* ev=(const uint2*)(emb+(size_t)v*H);
+    float acc[16]; for(int m=0;m<mtok;++m)acc[m]=0.f; int nv=H/4;
+    for(int vi=lane;vi<nv;vi+=32){ uint2 ww=__ldcs(&ev[vi]); const uint16_t* b=(const uint16_t*)&ww; int h=vi*4;
+        __half2 w01=__floats2half2_rn(bf2f(b[0]),bf2f(b[1])), w23=__floats2half2_rn(bf2f(b[2]),bf2f(b[3]));
+        for(int m=0;m<mtok;++m){ const __half2* xh=(const __half2*)(hn16+(size_t)m*H+h);
+            __half2 a=__hfma2(w23,xh[1],__hmul2(w01,xh[0])); acc[m]+=__half2float(__low2half(a))+__half2float(__high2half(a)); } }
+    for(int m=0;m<mtok;++m){
+        #pragma unroll
+        for(int s=16;s>0;s>>=1) acc[m]+=__shfl_down_sync(0xffffffffu,acc[m],s);
+        if(lane==0) out[(size_t)m*V+v]=acc[m]; }
+}
 // device argmax over V for each of mtok rows
 __global__ void k_argmax(int* out,const float* lg,int V){
     int p=blockIdx.x; __shared__ float sv[256]; __shared__ int si[256];
@@ -574,7 +588,8 @@ int main(int argc,char**argv){
             for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,k+1,0,L); moe(m,h,k+1,L);
                 int j=tap_slot(L); if(j>=0) k_tap<<<((k+1)*H+255)/256,256>>>(taps_blk,h,k+1,j,H); }
             rmsnorm(DS->hln, h, m.dptr<const uint16_t*>("model.language_model.norm.weight"), k+1, H, EPS, 0);
-            k_lmhead_batched<<<VOCAB,256,(size_t)H*4>>>(DS->lg2, DS->hln, embed, H, VOCAB, k+1);
+            k_f32_to_f16<<<((k+1)*H+255)/256,256>>>(DS->xh16, DS->hln, (k+1)*H);   // fp16 hidden for half2 lmhead
+            k_lmhead_batched_h2<<<(VOCAB+7)/8,256>>>(DS->lg2, DS->xh16, embed, H, VOCAB, k+1);
             k_argmax<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB);
         };
         bool vUseGraph=!getenv("NOGRAPH"); bool vCap=false; cudaGraph_t vg; cudaGraphExec_t vexec;
